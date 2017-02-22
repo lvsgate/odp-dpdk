@@ -345,6 +345,31 @@ typedef union odp_pktout_config_opt_t {
 } odp_pktout_config_opt_t;
 
 /**
+ * Packet IO fdir configuration options
+ *
+ */
+typedef struct odp_fdir_config_t {
+	int fdir_mode;
+	uint16_t vlan_tci_mask;   /**< Bit mask for vlan_tci in big endian */
+	/** Bit mask for ipv4 flow in big endian. */
+	uint32_t src_ipv4_mask;
+	uint32_t dst_ipv4_mask;
+	/** Bit maks for ipv6 flow in big endian. */
+	uint32_t src_ipv6_mask[4];
+	uint32_t dst_ipv6_mask[4];	
+	uint16_t src_port_mask;
+	/** Bit mask for L4 destination port in big endian. */
+	uint16_t dst_port_mask;
+	/** 6 bit mask for proper 6 bytes of Mac address, bit 0 matches the
+	    first byte on the wire */
+	uint8_t mac_addr_byte_mask;
+	/** Bit mask for tunnel ID in big endian. */
+	uint32_t tunnel_id_mask;
+	uint8_t tunnel_type_mask; /**< 1 - Match tunnel type,
+				       0 - Ignore tunnel type. */
+} odp_fdir_config_t;
+
+/**
  * Packet IO configuration options
  *
  * Packet IO interface level configuration options. Use odp_pktio_capability()
@@ -361,6 +386,8 @@ typedef struct odp_pktio_config_t {
 	 *
 	 *  Default value for all bits is zero. */
 	odp_pktout_config_opt_t pktout;
+
+	odp_fdir_config_t fdir_conf;
 
 	/** Interface loopback mode
 	 *

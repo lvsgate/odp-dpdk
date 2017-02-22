@@ -201,6 +201,7 @@ static int start_pkt_dpdk(pktio_entry_t *pktio_entry)
 	uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
 	uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 	struct rte_eth_rss_conf rss_conf;
+	odp_fdir_config_t *config = &pktio_entry->s.config.fdir_conf;
 
 	/* DPDK doesn't support nb_rx_q/nb_tx_q being 0 */
 	if (!pktio_entry->s.num_in_queue)
@@ -209,6 +210,25 @@ static int start_pkt_dpdk(pktio_entry_t *pktio_entry)
 		pktio_entry->s.num_out_queue = 1;
 
 	rss_conf_to_hash_proto(&rss_conf, &pkt_dpdk->hash);
+
+	struct rte_fdir_conf fdir_conf = {
+		.mode = config->fdir_mode,
+		.pballoc = RTE_FDIR_PBALLOC_64K,
+		.status = RTE_FDIR_REPORT_STATUS,
+		.mask = {
+			.vlan_tci_mask = config->vlan_tci_mask,
+			.ipv4_mask = {
+				.src_ip = config->src_ipv4_mask,
+				.dst_ip = config->dst_ipv4_mask,
+			},
+			.src_port_mask = config->src_port_mask,
+			.dst_port_mask = config->dst_port_mask,
+			.mac_addr_byte_mask = config->mac_addr_byte_mask,
+			.tunnel_id_mask = config->tunnel_id_mask,
+			.tunnel_type_mask = config->tunnel_type_mask,
+		},
+		.drop_queue = 127,
+	};
 
 	struct rte_eth_conf port_conf = {
 		.rxmode = {
@@ -226,6 +246,7 @@ static int start_pkt_dpdk(pktio_entry_t *pktio_entry)
 		.txmode = {
 			.mq_mode = ETH_MQ_TX_NONE,
 		},
+		.fdir_conf = fdir_conf,
 	};
 
 	/* rx packet len same size as pool segment minus headroom and double
