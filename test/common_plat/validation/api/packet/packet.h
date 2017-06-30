@@ -30,8 +30,15 @@ void packet_test_add_rem_data(void);
 void packet_test_copy(void);
 void packet_test_copydata(void);
 void packet_test_concatsplit(void);
+void packet_test_concat_small(void);
+void packet_test_concat_extend_trunc(void);
+void packet_test_extend_small(void);
+void packet_test_extend_large(void);
+void packet_test_extend_mix(void);
+void packet_test_extend_ref(void);
 void packet_test_align(void);
 void packet_test_offset(void);
+void packet_test_ref(void);
 
 /* test arrays: */
 extern odp_testinfo_t packet_suite[];

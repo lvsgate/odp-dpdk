@@ -44,6 +44,8 @@ const pktio_if_ops_t * const pktio_if_ops[]  = {
 
 extern pktio_table_t *pktio_tbl;
 
+static uint32_t mtu_get_pkt_dpdk(pktio_entry_t *pktio_entry);
+
 /* Test if s has only digits or not. Dpdk pktio uses only digits.*/
 static int _dpdk_netdev_is_valid(const char *s)
 {
@@ -489,15 +491,23 @@ static int send_pkt_dpdk(pktio_entry_t *pktio_entry, int index,
 	if (!pkt_dpdk->lockless_tx)
 		odp_ticketlock_unlock(&pkt_dpdk->tx_lock[index]);
 
-	if (odp_unlikely(pkts == 0 && rte_errno != 0)) {
-		return -1;
-	} else {
-		rte_errno = 0;
-		return pkts;
+	if (pkts == 0) {
+		uint32_t mtu;
+
+		if (odp_unlikely(rte_errno != 0))
+			return -1;
+
+		mtu = mtu_get_pkt_dpdk(pktio_entry);
+		if (odp_unlikely(odp_packet_len(pkt_table[0]) > mtu)) {
+			__odp_errno = EMSGSIZE;
+			return -1;
+		}
 	}
+	rte_errno = 0;
+	return pkts;
 }
 
-static int _dpdk_vdev_mtu(uint8_t port_id)
+static uint32_t _dpdk_vdev_mtu(uint8_t port_id)
 {
 	struct rte_eth_dev_info dev_info = {0};
 	struct ifreq ifr;
@@ -511,7 +521,7 @@ static int _dpdk_vdev_mtu(uint8_t port_id)
 	close(sockfd);
 	if (ret < 0) {
 		ODP_DBG("ioctl SIOCGIFMTU error\n");
-		return -1;
+		return 0;
 	}
 
 	return ifr.ifr_mtu;
@@ -519,13 +529,12 @@ static int _dpdk_vdev_mtu(uint8_t port_id)
 
 static uint32_t mtu_get_pkt_dpdk(pktio_entry_t *pktio_entry)
 {
-	uint16_t mtu;
+	uint16_t mtu = 0;
 	int ret;
 
-	ret = rte_eth_dev_get_mtu(pktio_entry->s.pkt_dpdk.portid,
-			&mtu);
+	ret = rte_eth_dev_get_mtu(pktio_entry->s.pkt_dpdk.portid, &mtu);
 	if (ret < 0)
-		return -2;
+		return 0;
 
 	/* some dpdk PMD vdev does not support getting mtu size,
 	 * try to use system call if dpdk cannot get mtu value.

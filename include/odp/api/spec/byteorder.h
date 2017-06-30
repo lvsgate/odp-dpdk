@@ -4,7 +4,6 @@
  * SPDX-License-Identifier:     BSD-3-Clause
  */
 
-
 /**
  * @file
  *
@@ -13,7 +12,7 @@
 
 #ifndef ODP_API_BYTEORDER_H_
 #define ODP_API_BYTEORDER_H_
-#include <odp/api/visibility_begin.h>
+#include <odp/visibility_begin.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +38,9 @@ extern "C" {
  *
  * @def ODP_BYTE_ORDER
  * Selected byte order
+ *
+ * @def ODP_BITFIELD_ORDER
+ * Selected bitfield order
  */
 
 /**
@@ -92,7 +94,6 @@ uint32_t odp_be_to_cpu_32(odp_u32be_t be32);
  */
 uint64_t odp_be_to_cpu_64(odp_u64be_t be64);
 
-
 /*
  * CPU byte order -> Big Endian:
  */
@@ -118,7 +119,6 @@ odp_u32be_t odp_cpu_to_be_32(uint32_t cpu32);
  */
 odp_u64be_t odp_cpu_to_be_64(uint64_t cpu64);
 
-
 /*
  * Little Endian -> CPU byte order:
  */
@@ -143,7 +143,6 @@ uint32_t odp_le_to_cpu_32(odp_u32le_t le32);
  * @return  cpu native uint64_t
  */
 uint64_t odp_le_to_cpu_64(odp_u64le_t le64);
-
 
 /*
  * CPU byte order -> Little Endian:
@@ -178,5 +177,5 @@ odp_u64le_t odp_cpu_to_le_64(uint64_t cpu64);
 }
 #endif
 
-#include <odp/api/visibility_end.h>
+#include <odp/visibility_end.h>
 #endif

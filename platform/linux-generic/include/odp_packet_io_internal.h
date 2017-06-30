@@ -102,6 +102,8 @@ typedef	struct {
 				     packet, 0 - not yet ready */
 	void *pinfo;
 	odp_shm_t pinfo_shm;
+	odp_shm_t remote_pool_shm; /**< shm of remote pool get with
+					_ipc_map_remote_pool() */
 } _ipc_pktio_t;
 
 struct pktio_entry {
@@ -174,7 +176,7 @@ struct pktio_entry {
 
 typedef union {
 	struct pktio_entry s;
-	uint8_t pad[ODP_CACHE_LINE_SIZE_ROUNDUP(sizeof(struct pktio_entry))];
+	uint8_t pad[ROUNDUP_CACHE_LINE(sizeof(struct pktio_entry))];
 } pktio_entry_t;
 
 typedef struct {

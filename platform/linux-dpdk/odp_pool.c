@@ -40,9 +40,12 @@
 #define LOCK_INIT(a) odp_spinlock_init(a)
 #endif
 
+/* Define a practical limit for contiguous memory allocations */
+#define MAX_SIZE   (10 * 1024 * 1024)
+
 typedef struct pool_table_t {
 	pool_entry_t pool[ODP_CONFIG_POOLS];
-
+	odp_shm_t shm;
 } pool_table_t;
 
 
@@ -68,7 +71,7 @@ int odp_pool_init_global(void)
 		return -1;
 
 	memset(pool_tbl, 0, sizeof(pool_table_t));
-
+	pool_tbl->shm = shm;
 
 	for (i = 0; i < ODP_CONFIG_POOLS; i++) {
 		/* init locks */
@@ -95,7 +98,13 @@ int odp_pool_init_local(void)
 
 int odp_pool_term_global(void)
 {
-	return 0;
+	int ret;
+
+	ret = odp_shm_free(pool_tbl->shm);
+	if (ret < 0)
+		ODP_ERR("shm free failed");
+
+	return ret;
 }
 
 int odp_pool_term_local(void)
@@ -112,24 +121,23 @@ int odp_pool_capability(odp_pool_capability_t *capa)
 	/* Buffer pools */
 	capa->buf.max_pools = ODP_CONFIG_POOLS;
 	capa->buf.max_align = ODP_CONFIG_BUFFER_ALIGN_MAX;
-	capa->buf.max_size  = 0;
-	capa->buf.max_num   = 0;
+	capa->buf.max_size  = MAX_SIZE;
+	capa->buf.max_num   = CONFIG_POOL_MAX_NUM;
 
 	/* Packet pools */
 	capa->pkt.max_pools        = ODP_CONFIG_POOLS;
-	capa->pkt.max_len          = ODP_CONFIG_PACKET_MAX_SEGS *
-				     ODP_CONFIG_PACKET_SEG_LEN_MIN;
-	capa->pkt.max_num	   = 0;
-	capa->pkt.min_headroom     = ODP_CONFIG_PACKET_HEADROOM;
-	capa->pkt.min_tailroom     = ODP_CONFIG_PACKET_TAILROOM;
-	capa->pkt.max_segs_per_pkt = ODP_CONFIG_PACKET_MAX_SEGS;
-	capa->pkt.min_seg_len      = ODP_CONFIG_PACKET_SEG_LEN_MIN;
-	capa->pkt.max_seg_len      = ODP_CONFIG_PACKET_SEG_LEN_MAX;
-	capa->pkt.max_uarea_size   = 0;
+	capa->pkt.max_len          = 0;
+	capa->pkt.max_num	   = CONFIG_POOL_MAX_NUM;
+	capa->pkt.min_headroom     = CONFIG_PACKET_HEADROOM;
+	capa->pkt.min_tailroom     = CONFIG_PACKET_TAILROOM;
+	capa->pkt.max_segs_per_pkt = CONFIG_PACKET_MAX_SEGS;
+	capa->pkt.min_seg_len      = CONFIG_PACKET_SEG_LEN_MIN;
+	capa->pkt.max_seg_len      = CONFIG_PACKET_SEG_LEN_MAX;
+	capa->pkt.max_uarea_size   = MAX_SIZE;
 
 	/* Timeout pools */
 	capa->tmo.max_pools = ODP_CONFIG_POOLS;
-	capa->tmo.max_num   = 0;
+	capa->tmo.max_num   = CONFIG_POOL_MAX_NUM;
 
 	return 0;
 }
@@ -192,7 +200,7 @@ odp_dpdk_mbuf_ctor(struct rte_mempool *mp,
 	mb->buf_physaddr = rte_mempool_virt2phy(mp, mb) +
 			mb_ctor_arg->seg_buf_offset;
 	mb->buf_len      = mb_ctor_arg->seg_buf_size;
-	mb->priv_size = mb_ctor_arg->seg_buf_offset - sizeof(struct rte_mbuf);
+	mb->priv_size = rte_pktmbuf_priv_size(mp);
 
 	/* keep some headroom between start of buffer and data */
 	if (mb_ctor_arg->type == ODP_POOL_PACKET) {
@@ -228,6 +236,67 @@ odp_dpdk_mbuf_ctor(struct rte_mempool *mp,
 	}						\
 } while (0)
 
+static int check_params(odp_pool_param_t *params)
+{
+	odp_pool_capability_t capa;
+
+	odp_pool_capability(&capa);
+
+	switch (params->type) {
+	case ODP_POOL_BUFFER:
+		if (params->buf.num > capa.buf.max_num) {
+			printf("buf.num too large %u\n", params->buf.num);
+			return -1;
+		}
+
+		if (params->buf.size > capa.buf.max_size) {
+			printf("buf.size too large %u\n", params->buf.size);
+			return -1;
+		}
+
+		if (params->buf.align > capa.buf.max_align) {
+			printf("buf.align too large %u\n", params->buf.align);
+			return -1;
+		}
+
+		break;
+
+	case ODP_POOL_PACKET:
+		if (params->pkt.num > capa.pkt.max_num) {
+			printf("pkt.num too large %u\n", params->pkt.num);
+
+			return -1;
+		}
+
+		if (params->pkt.seg_len > capa.pkt.max_seg_len) {
+			printf("pkt.seg_len too large %u\n",
+			       params->pkt.seg_len);
+			return -1;
+		}
+
+		if (params->pkt.uarea_size > capa.pkt.max_uarea_size) {
+			printf("pkt.uarea_size too large %u\n",
+			       params->pkt.uarea_size);
+			return -1;
+		}
+
+		break;
+
+	case ODP_POOL_TIMEOUT:
+		if (params->tmo.num > capa.tmo.max_num) {
+			printf("tmo.num too large %u\n", params->tmo.num);
+			return -1;
+		}
+		break;
+
+	default:
+		printf("bad pool type %i\n", params->type);
+		return -1;
+	}
+
+	return 0;
+}
+
 odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 {
 	struct mbuf_pool_ctor_arg mbp_ctor_arg;
@@ -236,15 +305,22 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 	unsigned mb_size, i, cache_size;
 	size_t hdr_size;
 	pool_entry_t *pool;
-	uint32_t buf_align, blk_size, headroom, tailroom, seg_len;
+	uint32_t buf_align, blk_size, headroom, tailroom, min_seg_len;
+	uint32_t max_len, min_align;
+	char pool_name[ODP_POOL_NAME_LEN];
 	char *rte_name = NULL;
 #if RTE_MEMPOOL_CACHE_MAX_SIZE > 0
 	unsigned j;
 #endif
 
-	if (strlen(name) > ODP_POOL_NAME_LEN - 1) {
-		ODP_ERR("Name too long! (%u characters)\n", strlen(name));
+	if (check_params(params))
 		return ODP_POOL_INVALID;
+
+	if (name == NULL) {
+		pool_name[0] = 0;
+	} else {
+		strncpy(pool_name, name, ODP_POOL_NAME_LEN - 1);
+		pool_name[ODP_POOL_NAME_LEN - 1] = 0;
 	}
 
 	/* Find an unused buffer pool slot and initalize it as requested */
@@ -268,7 +344,7 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 			/* Validate requested buffer alignment */
 			if (buf_align > ODP_CONFIG_BUFFER_ALIGN_MAX ||
 			    buf_align !=
-			    ODP_ALIGN_ROUNDDOWN_POWER_2(buf_align, buf_align)) {
+			    ROUNDDOWN_POWER2(buf_align, buf_align)) {
 				UNLOCK(&pool->s.lock);
 				return ODP_POOL_INVALID;
 			}
@@ -279,46 +355,47 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 			else if (buf_align < ODP_CONFIG_BUFFER_ALIGN_MIN)
 				buf_align = ODP_CONFIG_BUFFER_ALIGN_MIN;
 
-			/* Optimize small raw buffers */
-			if (blk_size > ODP_MAX_INLINE_BUF ||
-			    params->buf.align != 0)
-				blk_size = ODP_ALIGN_ROUNDUP(blk_size,
-							     buf_align);
+			if (params->buf.align != 0)
+				blk_size = ROUNDUP_ALIGN(blk_size,
+							 buf_align);
 
 			hdr_size = sizeof(odp_buffer_hdr_t);
 			CHECK_U16_OVERFLOW(blk_size);
 			mbp_ctor_arg.pkt.mbuf_data_room_size = blk_size;
 			num = params->buf.num;
 			ODP_DBG("type: buffer name: %s num: "
-				"%u size: %u align: %u\n", name, num,
+				"%u size: %u align: %u\n", pool_name, num,
 				params->buf.size, params->buf.align);
 			break;
 		case ODP_POOL_PACKET:
-			headroom = ODP_CONFIG_PACKET_HEADROOM;
-			tailroom = ODP_CONFIG_PACKET_TAILROOM;
-			seg_len = params->pkt.seg_len <= ODP_CONFIG_PACKET_SEG_LEN_MIN ?
-				ODP_CONFIG_PACKET_SEG_LEN_MIN :
-				(params->pkt.seg_len <= ODP_CONFIG_PACKET_SEG_LEN_MAX ?
-				 params->pkt.seg_len : ODP_CONFIG_PACKET_SEG_LEN_MAX);
+			headroom = CONFIG_PACKET_HEADROOM;
+			tailroom = CONFIG_PACKET_TAILROOM;
+			min_seg_len = CONFIG_PACKET_SEG_LEN_MIN;
+			min_align = ODP_CONFIG_BUFFER_ALIGN_MIN;
 
-			seg_len = ODP_ALIGN_ROUNDUP(
-				headroom + seg_len + tailroom,
-				ODP_CONFIG_BUFFER_ALIGN_MIN);
-			blk_size = params->pkt.len <= seg_len ? seg_len :
-				ODP_ALIGN_ROUNDUP(params->pkt.len, seg_len);
+			blk_size = min_seg_len;
+			if (params->pkt.seg_len > blk_size)
+				blk_size = params->pkt.seg_len;
+			if (params->pkt.len > blk_size)
+				blk_size = params->pkt.len;
+			/* Make sure at least one max len packet fits in the
+			 * pool.
+			 */
+			max_len = 0;
+			if (params->pkt.max_len != 0)
+				max_len = params->pkt.max_len;
+			if ((max_len + blk_size) / blk_size > params->pkt.num)
+				blk_size = (max_len + params->pkt.num) /
+					params->pkt.num;
+			blk_size = ROUNDUP_ALIGN(headroom + blk_size +
+						 tailroom, min_align);
 			/* Segment size minus headroom might be rounded down by
 			 * the driver to the nearest multiple of 1024. Round it
 			 * up here to make sure the requested size still going
 			 * to fit there without segmentation.
 			 */
-			blk_size = ODP_ALIGN_ROUNDUP(blk_size - headroom, ODP_CONFIG_PACKET_SEG_LEN_MIN) +
-				   headroom;
-
-			/* Reject create if pkt.len needs too many segments */
-			if (blk_size / seg_len > ODP_BUFFER_MAX_SEG) {
-				UNLOCK(&pool->s.lock);
-				return ODP_POOL_INVALID;
-			}
+			blk_size = ROUNDUP_ALIGN(blk_size - headroom,
+						 min_seg_len) + headroom;
 
 			hdr_size = sizeof(odp_packet_hdr_t) +
 				   params->pkt.uarea_size;
@@ -326,11 +403,11 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 			CHECK_U16_OVERFLOW(blk_size);
 			mbp_ctor_arg.pkt.mbuf_data_room_size = blk_size;
 			num = params->pkt.num;
+
 			ODP_DBG("type: packet, name: %s, "
-				"num: %u, len: %u, seg_len: %u, blk_size %d, "
+				"num: %u, len: %u, blk_size: %u, "
 				"uarea_size %d, hdr_size %d\n",
-				name, num, params->pkt.len,
-				params->pkt.seg_len, blk_size,
+				pool_name, num, params->pkt.len, blk_size,
 				params->pkt.uarea_size, hdr_size);
 			break;
 		case ODP_POOL_TIMEOUT:
@@ -338,7 +415,7 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 			mbp_ctor_arg.pkt.mbuf_data_room_size = 0;
 			num = params->tmo.num;
 			ODP_DBG("type: tmo name: %s num: %u\n",
-				name, num);
+				pool_name, num);
 			break;
 		default:
 			ODP_ERR("Bad type %i\n",
@@ -349,11 +426,13 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 		}
 
 		mb_ctor_arg.seg_buf_offset =
-			(uint16_t) ODP_CACHE_LINE_SIZE_ROUNDUP(hdr_size);
+			(uint16_t)ROUNDUP_CACHE_LINE(hdr_size);
 		mb_ctor_arg.seg_buf_size = mbp_ctor_arg.pkt.mbuf_data_room_size;
 		mb_ctor_arg.type = params->type;
 		mb_size = mb_ctor_arg.seg_buf_offset + mb_ctor_arg.seg_buf_size;
 		mbp_ctor_arg.pool_hdl = pool->s.pool_hdl;
+		mbp_ctor_arg.pkt.mbuf_priv_size = mb_ctor_arg.seg_buf_offset -
+			sizeof(struct rte_mbuf);
 
 		ODP_DBG("Metadata size: %u, mb_size %d\n",
 			mb_ctor_arg.seg_buf_offset, mb_size);
@@ -374,16 +453,16 @@ odp_pool_t odp_pool_create(const char *name, odp_pool_param_t *params)
 #endif
 		ODP_DBG("cache_size %d\n", cache_size);
 
-		if (strlen(name) > RTE_MEMPOOL_NAMESIZE - 1) {
+		if (strlen(pool_name) > RTE_MEMPOOL_NAMESIZE - 1) {
 			ODP_ERR("Max pool name size: %u. Trimming %u long, name collision might happen!\n",
-				RTE_MEMPOOL_NAMESIZE - 1, strlen(name));
+				RTE_MEMPOOL_NAMESIZE - 1, strlen(pool_name));
 			rte_name = malloc(RTE_MEMPOOL_NAMESIZE);
 			snprintf(rte_name, RTE_MEMPOOL_NAMESIZE - 1, "%s",
-				 name);
+				 pool_name);
 		}
 
 		pool->s.rte_mempool =
-			rte_mempool_create(rte_name ? rte_name : name,
+			rte_mempool_create(rte_name ? rte_name : pool_name,
 					   num,
 					   mb_size,
 					   cache_size,
@@ -466,10 +545,7 @@ static odp_buffer_t buffer_alloc(pool_entry_t *pool)
 		rte_errno = ENOMEM;
 		return ODP_BUFFER_INVALID;
 	} else {
-		odp_buf_to_hdr(buffer)->next = NULL;
-		/* By default, buffers are not associated with an ordered
-		 * queue */
-		odp_buf_to_hdr(buffer)->origin_qe = NULL;
+		buf_hdl_to_hdr(buffer)->next = NULL;
 		return buffer;
 	}
 }
@@ -556,10 +632,16 @@ int odp_pool_destroy(odp_pool_t pool_hdl)
 
 odp_pool_t odp_buffer_pool(odp_buffer_t buf)
 {
-	return odp_buf_to_hdr(buf)->pool_hdl;
+	return buf_hdl_to_hdr(buf)->pool_hdl;
 }
 
 void odp_pool_param_init(odp_pool_param_t *params)
 {
 	memset(params, 0, sizeof(odp_pool_param_t));
 }
+
+uint64_t odp_pool_to_u64(odp_pool_t hdl)
+{
+	return _odp_pri(hdl);
+}
+

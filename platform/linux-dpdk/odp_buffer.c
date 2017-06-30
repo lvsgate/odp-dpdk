@@ -25,31 +25,29 @@ odp_event_t odp_buffer_to_event(odp_buffer_t buf)
 
 void *odp_buffer_addr(odp_buffer_t buf)
 {
-	odp_buffer_hdr_t *hdr = odp_buf_to_hdr(buf);
+	odp_buffer_hdr_t *hdr = buf_hdl_to_hdr(buf);
 
 	return hdr->mb.buf_addr;
 }
 
-
 uint32_t odp_buffer_size(odp_buffer_t buf)
 {
-	odp_buffer_hdr_t *hdr = odp_buf_to_hdr(buf);
+	odp_buffer_hdr_t *hdr = buf_hdl_to_hdr(buf);
 	struct rte_mbuf *mbuf = (struct rte_mbuf *)hdr;
 
 	return mbuf->buf_len;
 }
 
-
 int _odp_buffer_type(odp_buffer_t buf)
 {
-	odp_buffer_hdr_t *hdr = odp_buf_to_hdr(buf);
+	odp_buffer_hdr_t *hdr = buf_hdl_to_hdr(buf);
 
 	return hdr->type;
 }
 
 void _odp_buffer_type_set(odp_buffer_t buf, int type)
 {
-	odp_buffer_hdr_t *hdr = odp_buf_to_hdr(buf);
+	odp_buffer_hdr_t *hdr = buf_hdl_to_hdr(buf);
 
 	hdr->type = type;
 }
@@ -61,7 +59,6 @@ int odp_buffer_is_valid(odp_buffer_t buf)
 	return buf != ODP_BUFFER_INVALID;
 }
 
-
 int odp_buffer_snprint(char *str, uint32_t n, odp_buffer_t buf)
 {
 	odp_buffer_hdr_t *hdr;
@@ -72,7 +69,7 @@ int odp_buffer_snprint(char *str, uint32_t n, odp_buffer_t buf)
 		return len;
 	}
 
-	hdr = odp_buf_to_hdr(buf);
+	hdr = buf_hdl_to_hdr(buf);
 
 	len += snprintf(&str[len], n-len,
 			"Buffer\n");
@@ -93,7 +90,6 @@ int odp_buffer_snprint(char *str, uint32_t n, odp_buffer_t buf)
 	return len;
 }
 
-
 void odp_buffer_print(odp_buffer_t buf)
 {
 	int max_len = 512;
@@ -104,4 +100,9 @@ void odp_buffer_print(odp_buffer_t buf)
 	str[len] = 0;
 
 	ODP_PRINT("\n%s\n", str);
+}
+
+uint64_t odp_buffer_to_u64(odp_buffer_t hdl)
+{
+	return _odp_pri(hdl);
 }

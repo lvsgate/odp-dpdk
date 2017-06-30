@@ -13,6 +13,8 @@
 #define PACKET_BUF_LEN	ODP_CONFIG_PACKET_SEG_LEN_MIN
 /* Reserve some tailroom for tests */
 #define PACKET_TAILROOM_RESERVE  4
+/* Number of packets in the test packet pool */
+#define PACKET_POOL_NUM 300
 
 static odp_pool_t packet_pool, packet_pool_no_uarea, packet_pool_double_uarea;
 static uint32_t packet_len;
@@ -32,11 +34,19 @@ static struct udata_struct {
 	"abcdefg",
 };
 
-static void _packet_compare_data(odp_packet_t pkt1, odp_packet_t pkt2)
+#define packet_compare_offset(pkt1, off1, pkt2, off2, len) \
+	_packet_compare_offset((pkt1), (off1), (pkt2), (off2), (len), __LINE__)
+
+#define packet_compare_data(pkt1, pkt2) \
+	_packet_compare_data((pkt1), (pkt2), __LINE__)
+
+static void _packet_compare_data(odp_packet_t pkt1, odp_packet_t pkt2,
+				 int line)
 {
 	uint32_t len = odp_packet_len(pkt1);
 	uint32_t offset = 0;
 	uint32_t seglen1, seglen2, cmplen;
+	int ret;
 
 	CU_ASSERT_FATAL(len == odp_packet_len(pkt2));
 
@@ -47,11 +57,50 @@ static void _packet_compare_data(odp_packet_t pkt1, odp_packet_t pkt2)
 		CU_ASSERT_PTR_NOT_NULL_FATAL(pkt1map);
 		CU_ASSERT_PTR_NOT_NULL_FATAL(pkt2map);
 		cmplen = seglen1 < seglen2 ? seglen1 : seglen2;
-		CU_ASSERT(!memcmp(pkt1map, pkt2map, cmplen));
+		ret = memcmp(pkt1map, pkt2map, cmplen);
+
+		if (ret) {
+			printf("\ncompare_data failed: line %i, offset %"
+			       PRIu32 "\n", line, offset);
+		}
+
+		CU_ASSERT(ret == 0);
 
 		offset += cmplen;
 		len    -= cmplen;
 	}
+}
+
+static int fill_data_forward(odp_packet_t pkt, uint32_t offset, uint32_t len,
+			     uint32_t *cur_data)
+{
+	uint8_t buf[len];
+	uint32_t i, data;
+
+	data = *cur_data;
+
+	for (i = 0; i < len; i++)
+		buf[i] = data++;
+
+	*cur_data = data;
+
+	return odp_packet_copy_from_mem(pkt, offset, len, buf);
+}
+
+static int fill_data_backward(odp_packet_t pkt, uint32_t offset, uint32_t len,
+			      uint32_t *cur_data)
+{
+	uint8_t buf[len];
+	uint32_t i, data;
+
+	data = *cur_data;
+
+	for (i = 0; i < len; i++)
+		buf[len - i - 1] = data++;
+
+	*cur_data = data;
+
+	return odp_packet_copy_from_mem(pkt, offset, len, buf);
 }
 
 int packet_suite_init(void)
@@ -62,11 +111,21 @@ int packet_suite_init(void)
 	uint32_t udat_size;
 	uint8_t data = 0;
 	uint32_t i;
+	uint32_t num = PACKET_POOL_NUM;
 
-	if (odp_pool_capability(&capa) < 0)
+	if (odp_pool_capability(&capa) < 0) {
+		printf("pool_capability failed\n");
 		return -1;
+	}
+	if (capa.pkt.max_segs_per_pkt == 0)
+		capa.pkt.max_segs_per_pkt = 10;
 
-	packet_len = capa.pkt.min_seg_len - PACKET_TAILROOM_RESERVE;
+	/* Pick a typical packet size and decrement it to the single segment
+	 * limit if needed (min_seg_len maybe equal to max_len
+	 * on some systems). */
+	packet_len = 512;
+	while (packet_len > (capa.pkt.min_seg_len - PACKET_TAILROOM_RESERVE))
+		packet_len--;
 
 	if (capa.pkt.max_len) {
 		segmented_packet_len = capa.pkt.max_len;
@@ -74,24 +133,29 @@ int packet_suite_init(void)
 		segmented_packet_len = capa.pkt.min_seg_len *
 				       capa.pkt.max_segs_per_pkt;
 	}
+	if (capa.pkt.max_num != 0 && capa.pkt.max_num < num)
+		num = capa.pkt.max_num;
 
 	odp_pool_param_init(&params);
 
 	params.type           = ODP_POOL_PACKET;
 	params.pkt.seg_len    = capa.pkt.min_seg_len;
 	params.pkt.len        = capa.pkt.min_seg_len;
-	params.pkt.num        = 100;
+	params.pkt.num        = num;
 	params.pkt.uarea_size = sizeof(struct udata_struct);
 
 	packet_pool = odp_pool_create("packet_pool", &params);
-	if (packet_pool == ODP_POOL_INVALID)
+	if (packet_pool == ODP_POOL_INVALID) {
+		printf("pool_create failed: 1\n");
 		return -1;
+	}
 
 	params.pkt.uarea_size = 0;
 	packet_pool_no_uarea = odp_pool_create("packet_pool_no_uarea",
 					       &params);
 	if (packet_pool_no_uarea == ODP_POOL_INVALID) {
 		odp_pool_destroy(packet_pool);
+		printf("pool_create failed: 2\n");
 		return -1;
 	}
 
@@ -102,6 +166,7 @@ int packet_suite_init(void)
 	if (packet_pool_double_uarea == ODP_POOL_INVALID) {
 		odp_pool_destroy(packet_pool_no_uarea);
 		odp_pool_destroy(packet_pool);
+		printf("pool_create failed: 3\n");
 		return -1;
 	}
 
@@ -122,8 +187,10 @@ int packet_suite_init(void)
 	} while (segmented_test_packet == ODP_PACKET_INVALID);
 
 	if (odp_packet_is_valid(test_packet) == 0 ||
-	    odp_packet_is_valid(segmented_test_packet) == 0)
+	    odp_packet_is_valid(segmented_test_packet) == 0) {
+		printf("packet_is_valid failed\n");
 		return -1;
+	}
 
 	segmentation_supported = odp_packet_is_segmented(segmented_test_packet);
 
@@ -135,15 +202,21 @@ int packet_suite_init(void)
 
 	udat = odp_packet_user_area(test_packet);
 	udat_size = odp_packet_user_area_size(test_packet);
-	if (!udat || udat_size != sizeof(struct udata_struct))
+	if (!udat || udat_size != sizeof(struct udata_struct)) {
+		printf("packet_user_area failed: 1\n");
 		return -1;
+	}
+
 	odp_pool_print(packet_pool);
 	memcpy(udat, &test_packet_udata, sizeof(struct udata_struct));
 
 	udat = odp_packet_user_area(segmented_test_packet);
 	udat_size = odp_packet_user_area_size(segmented_test_packet);
-	if (udat == NULL || udat_size != sizeof(struct udata_struct))
+	if (udat == NULL || udat_size != sizeof(struct udata_struct)) {
+		printf("packet_user_area failed: 2\n");
 		return -1;
+	}
+
 	memcpy(udat, &test_packet_udata, sizeof(struct udata_struct));
 
 	return 0;
@@ -179,6 +252,7 @@ void packet_test_alloc_free(void)
 	params.pkt.num        = 1;
 
 	pool = odp_pool_create("packet_pool_alloc", &params);
+	CU_ASSERT_FATAL(pool != ODP_POOL_INVALID);
 
 	/* Allocate the only buffer from the pool */
 	packet = odp_packet_alloc(pool, packet_len);
@@ -289,23 +363,85 @@ void packet_test_alloc_free_multi(void)
 
 void packet_test_alloc_segmented(void)
 {
+	const int num = 5;
+	odp_packet_t pkts[num];
 	odp_packet_t pkt;
-	uint32_t len;
+	uint32_t max_len;
+	odp_pool_t pool;
+	odp_pool_param_t params;
 	odp_pool_capability_t capa;
+	int ret, i, num_alloc;
 
 	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+	if (capa.pkt.max_segs_per_pkt == 0)
+		capa.pkt.max_segs_per_pkt = 10;
 
 	if (capa.pkt.max_len)
-		len = capa.pkt.max_len;
+		max_len = capa.pkt.max_len;
 	else
-		len = capa.pkt.min_seg_len * capa.pkt.max_segs_per_pkt;
+		max_len = capa.pkt.min_seg_len * capa.pkt.max_segs_per_pkt;
 
-	pkt = odp_packet_alloc(packet_pool, len);
+	odp_pool_param_init(&params);
+
+	params.type           = ODP_POOL_PACKET;
+	params.pkt.seg_len    = capa.pkt.min_seg_len;
+	params.pkt.len        = max_len;
+
+	/* Ensure that 'num' segmented packets can be allocated */
+	params.pkt.num        = num * capa.pkt.max_segs_per_pkt;
+
+	pool = odp_pool_create("pool_alloc_segmented", &params);
+	CU_ASSERT_FATAL(pool != ODP_POOL_INVALID);
+
+	/* Less than max len allocs */
+	pkt = odp_packet_alloc(pool, max_len / 2);
 	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
-	CU_ASSERT(odp_packet_len(pkt) == len);
-	if (segmentation_supported)
-		CU_ASSERT(odp_packet_is_segmented(pkt) == 1);
+	CU_ASSERT(odp_packet_len(pkt) == max_len / 2);
+
 	odp_packet_free(pkt);
+
+	num_alloc = 0;
+	for (i = 0; i < num; i++) {
+		ret = odp_packet_alloc_multi(pool, max_len / 2,
+					     &pkts[num_alloc], num - num_alloc);
+		CU_ASSERT_FATAL(ret >= 0);
+		num_alloc += ret;
+		if (num_alloc >= num)
+			break;
+	}
+
+	CU_ASSERT(num_alloc == num);
+
+	for (i = 0; i < num_alloc; i++)
+		CU_ASSERT(odp_packet_len(pkts[i]) == max_len / 2);
+
+	odp_packet_free_multi(pkts, num_alloc);
+
+	/* Max len allocs */
+	pkt = odp_packet_alloc(pool, max_len);
+	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+	CU_ASSERT(odp_packet_len(pkt) == max_len);
+
+	odp_packet_free(pkt);
+
+	num_alloc = 0;
+	for (i = 0; i < num; i++) {
+		ret = odp_packet_alloc_multi(pool, max_len,
+					     &pkts[num_alloc], num - num_alloc);
+		CU_ASSERT_FATAL(ret >= 0);
+		num_alloc += ret;
+		if (num_alloc >= num)
+			break;
+	}
+
+	CU_ASSERT(num_alloc == num);
+
+	for (i = 0; i < num_alloc; i++)
+		CU_ASSERT(odp_packet_len(pkts[i]) == max_len);
+
+	odp_packet_free_multi(pkts, num_alloc);
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
 }
 
 void packet_test_event_conversion(void)
@@ -321,7 +457,7 @@ void packet_test_event_conversion(void)
 	tmp_pkt = odp_packet_from_event(ev);
 	CU_ASSERT_FATAL(tmp_pkt != ODP_PACKET_INVALID);
 	CU_ASSERT(tmp_pkt == pkt);
-	_packet_compare_data(tmp_pkt, pkt);
+	packet_compare_data(tmp_pkt, pkt);
 }
 
 void packet_test_basic_metadata(void)
@@ -659,9 +795,10 @@ void packet_test_tailroom(void)
 	_verify_tailroom_shift(&pkt, 0);
 
 	if (segmentation_supported) {
-		_verify_tailroom_shift(&pkt, pull_val);
+		push_val = room + 100;
+		_verify_tailroom_shift(&pkt, push_val);
 		_verify_tailroom_shift(&pkt, 0);
-		_verify_tailroom_shift(&pkt, -pull_val);
+		_verify_tailroom_shift(&pkt, -push_val);
 	}
 
 	odp_packet_free(pkt);
@@ -960,9 +1097,10 @@ static void _packet_compare_udata(odp_packet_t pkt1, odp_packet_t pkt2)
 
 static void _packet_compare_offset(odp_packet_t pkt1, uint32_t off1,
 				   odp_packet_t pkt2, uint32_t off2,
-				   uint32_t len)
+				   uint32_t len, int line)
 {
 	uint32_t seglen1, seglen2, cmplen;
+	int ret;
 
 	if (off1 + len > odp_packet_len(pkt1) ||
 	    off2 + len > odp_packet_len(pkt2))
@@ -977,7 +1115,15 @@ static void _packet_compare_offset(odp_packet_t pkt1, uint32_t off1,
 		cmplen = seglen1 < seglen2 ? seglen1 : seglen2;
 		if (len < cmplen)
 			cmplen = len;
-		CU_ASSERT(!memcmp(pkt1map, pkt2map, cmplen));
+
+		ret = memcmp(pkt1map, pkt2map, cmplen);
+
+		if (ret) {
+			printf("\ncompare_offset failed: line %i, off1 %"
+			       PRIu32 ", off2 %" PRIu32 "\n", line, off1, off2);
+		}
+
+		CU_ASSERT(ret == 0);
 
 		off1 += cmplen;
 		off2 += cmplen;
@@ -1000,7 +1146,7 @@ void packet_test_copy(void)
 
 	pkt = odp_packet_copy(test_packet, odp_packet_pool(test_packet));
 	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
-	_packet_compare_data(pkt, test_packet);
+	packet_compare_data(pkt, test_packet);
 	pool = odp_packet_pool(pkt);
 	CU_ASSERT_FATAL(pool != ODP_POOL_INVALID);
 	pkt_copy = odp_packet_copy(pkt, pool);
@@ -1011,7 +1157,7 @@ void packet_test_copy(void)
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(pkt_copy));
 
 	_packet_compare_inflags(pkt, pkt_copy);
-	_packet_compare_data(pkt, pkt_copy);
+	packet_compare_data(pkt, pkt_copy);
 	CU_ASSERT(odp_packet_user_area_size(pkt) ==
 		  odp_packet_user_area_size(test_packet));
 	_packet_compare_udata(pkt, pkt_copy);
@@ -1020,7 +1166,7 @@ void packet_test_copy(void)
 
 	pkt = odp_packet_copy(test_packet, packet_pool_double_uarea);
 	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
-	_packet_compare_data(pkt, test_packet);
+	packet_compare_data(pkt, test_packet);
 	pool = odp_packet_pool(pkt);
 	CU_ASSERT_FATAL(pool != ODP_POOL_INVALID);
 	pkt_copy = odp_packet_copy(pkt, pool);
@@ -1031,7 +1177,7 @@ void packet_test_copy(void)
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(pkt_copy));
 
 	_packet_compare_inflags(pkt, pkt_copy);
-	_packet_compare_data(pkt, pkt_copy);
+	packet_compare_data(pkt, pkt_copy);
 	CU_ASSERT(odp_packet_user_area_size(pkt) ==
 		  2 * odp_packet_user_area_size(test_packet));
 	_packet_compare_udata(pkt, pkt_copy);
@@ -1050,7 +1196,7 @@ void packet_test_copy(void)
 	CU_ASSERT(odp_packet_data(pkt) != odp_packet_data(pkt_part));
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(pkt_part));
 
-	_packet_compare_data(pkt, pkt_part);
+	packet_compare_data(pkt, pkt_part);
 	odp_packet_free(pkt_part);
 
 	plen = odp_packet_len(pkt);
@@ -1058,14 +1204,14 @@ void packet_test_copy(void)
 		pkt_part = odp_packet_copy_part(pkt, i, plen / 4, pool);
 		CU_ASSERT_FATAL(pkt_part != ODP_PACKET_INVALID);
 		CU_ASSERT(odp_packet_len(pkt_part) == plen / 4);
-		_packet_compare_offset(pkt_part, 0, pkt, i, plen / 4);
+		packet_compare_offset(pkt_part, 0, pkt, i, plen / 4);
 		odp_packet_free(pkt_part);
 	}
 
 	/* Test copy and move apis */
 	CU_ASSERT(odp_packet_copy_data(pkt, 0, plen - plen / 8, plen / 8) == 0);
-	_packet_compare_offset(pkt, 0, pkt, plen - plen / 8, plen / 8);
-	_packet_compare_offset(pkt, 0, test_packet, plen - plen / 8, plen / 8);
+	packet_compare_offset(pkt, 0, pkt, plen - plen / 8, plen / 8);
+	packet_compare_offset(pkt, 0, test_packet, plen - plen / 8, plen / 8);
 
 	/* Test segment crossing if we support segments */
 	pkt_data = odp_packet_offset(pkt, 0, &seg_len, NULL);
@@ -1081,7 +1227,7 @@ void packet_test_copy(void)
 
 	pkt_part = odp_packet_copy_part(pkt, src_offset, 20, pool);
 	CU_ASSERT(odp_packet_move_data(pkt, dst_offset, src_offset, 20) == 0);
-	_packet_compare_offset(pkt, dst_offset, pkt_part, 0, 20);
+	packet_compare_offset(pkt, dst_offset, pkt_part, 0, 20);
 
 	odp_packet_free(pkt_part);
 	odp_packet_free(pkt);
@@ -1130,7 +1276,7 @@ void packet_test_copydata(void)
 						   1) == 0);
 	}
 
-	_packet_compare_offset(pkt, 0, test_packet, 0, pkt_len / 2);
+	packet_compare_offset(pkt, 0, test_packet, 0, pkt_len / 2);
 	odp_packet_free(pkt);
 
 	pkt = odp_packet_alloc(odp_packet_pool(segmented_test_packet),
@@ -1140,9 +1286,9 @@ void packet_test_copydata(void)
 	CU_ASSERT(odp_packet_copy_from_pkt(pkt, 0, segmented_test_packet,
 					   odp_packet_len(pkt) / 4,
 					   odp_packet_len(pkt)) == 0);
-	_packet_compare_offset(pkt, 0, segmented_test_packet,
-			       odp_packet_len(pkt) / 4,
-			       odp_packet_len(pkt));
+	packet_compare_offset(pkt, 0, segmented_test_packet,
+			      odp_packet_len(pkt) / 4,
+			      odp_packet_len(pkt));
 	odp_packet_free(pkt);
 }
 
@@ -1151,21 +1297,27 @@ void packet_test_concatsplit(void)
 	odp_packet_t pkt, pkt2;
 	uint32_t pkt_len;
 	odp_packet_t splits[4];
+	odp_pool_t pool;
 
-	pkt = odp_packet_copy(test_packet, odp_packet_pool(test_packet));
+	pool = odp_packet_pool(test_packet);
+	pkt  = odp_packet_copy(test_packet, pool);
+	pkt2 = odp_packet_copy(test_packet, pool);
 	pkt_len = odp_packet_len(test_packet);
 	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+	CU_ASSERT_FATAL(pkt2 != ODP_PACKET_INVALID);
+	CU_ASSERT(pkt_len == odp_packet_len(pkt));
+	CU_ASSERT(pkt_len == odp_packet_len(pkt2));
 
-	CU_ASSERT(odp_packet_concat(&pkt, pkt) == 0);
+	CU_ASSERT(odp_packet_concat(&pkt, pkt2) >= 0);
 	CU_ASSERT(odp_packet_len(pkt) == pkt_len * 2);
-	_packet_compare_offset(pkt, 0, pkt, pkt_len, pkt_len);
+	packet_compare_offset(pkt, 0, pkt, pkt_len, pkt_len);
 
 	CU_ASSERT(odp_packet_split(&pkt, pkt_len, &pkt2) == 0);
 	CU_ASSERT(pkt != pkt2);
 	CU_ASSERT(odp_packet_data(pkt) != odp_packet_data(pkt2));
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(pkt2));
-	_packet_compare_data(pkt, pkt2);
-	_packet_compare_data(pkt, test_packet);
+	packet_compare_data(pkt, pkt2);
+	packet_compare_data(pkt, test_packet);
 
 	odp_packet_free(pkt);
 	odp_packet_free(pkt2);
@@ -1175,26 +1327,26 @@ void packet_test_concatsplit(void)
 	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
 	pkt_len = odp_packet_len(pkt);
 
-	_packet_compare_data(pkt, segmented_test_packet);
+	packet_compare_data(pkt, segmented_test_packet);
 	CU_ASSERT(odp_packet_split(&pkt, pkt_len / 2, &splits[0]) == 0);
 	CU_ASSERT(pkt != splits[0]);
 	CU_ASSERT(odp_packet_data(pkt) != odp_packet_data(splits[0]));
 	CU_ASSERT(odp_packet_len(pkt) == pkt_len / 2);
 	CU_ASSERT(odp_packet_len(pkt) + odp_packet_len(splits[0]) == pkt_len);
 
-	_packet_compare_offset(pkt, 0, segmented_test_packet, 0, pkt_len / 2);
-	_packet_compare_offset(splits[0], 0, segmented_test_packet,
-			       pkt_len / 2, odp_packet_len(splits[0]));
+	packet_compare_offset(pkt, 0, segmented_test_packet, 0, pkt_len / 2);
+	packet_compare_offset(splits[0], 0, segmented_test_packet,
+			      pkt_len / 2, odp_packet_len(splits[0]));
 
-	CU_ASSERT(odp_packet_concat(&pkt, splits[0]) == 0);
-	_packet_compare_offset(pkt, 0, segmented_test_packet, 0, pkt_len / 2);
-	_packet_compare_offset(pkt, pkt_len / 2, segmented_test_packet,
-			       pkt_len / 2, pkt_len / 2);
-	_packet_compare_offset(pkt, 0, segmented_test_packet, 0,
-			       pkt_len);
+	CU_ASSERT(odp_packet_concat(&pkt, splits[0]) >= 0);
+	packet_compare_offset(pkt, 0, segmented_test_packet, 0, pkt_len / 2);
+	packet_compare_offset(pkt, pkt_len / 2, segmented_test_packet,
+			      pkt_len / 2, pkt_len / 2);
+	packet_compare_offset(pkt, 0, segmented_test_packet, 0,
+			      pkt_len);
 
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(segmented_test_packet));
-	_packet_compare_data(pkt, segmented_test_packet);
+	packet_compare_data(pkt, segmented_test_packet);
 
 	CU_ASSERT(odp_packet_split(&pkt, pkt_len / 2, &splits[0]) == 0);
 	CU_ASSERT(odp_packet_split(&pkt, pkt_len / 4, &splits[1]) == 0);
@@ -1203,14 +1355,611 @@ void packet_test_concatsplit(void)
 	CU_ASSERT(odp_packet_len(splits[0]) + odp_packet_len(splits[1]) +
 		  odp_packet_len(splits[2]) + odp_packet_len(pkt) == pkt_len);
 
-	CU_ASSERT(odp_packet_concat(&pkt, splits[2]) == 0);
-	CU_ASSERT(odp_packet_concat(&pkt, splits[1]) == 0);
-	CU_ASSERT(odp_packet_concat(&pkt, splits[0]) == 0);
+	CU_ASSERT(odp_packet_concat(&pkt, splits[2]) >= 0);
+	CU_ASSERT(odp_packet_concat(&pkt, splits[1]) >= 0);
+	CU_ASSERT(odp_packet_concat(&pkt, splits[0]) >= 0);
 
 	CU_ASSERT(odp_packet_len(pkt) == odp_packet_len(segmented_test_packet));
-	_packet_compare_data(pkt, segmented_test_packet);
+	packet_compare_data(pkt, segmented_test_packet);
 
 	odp_packet_free(pkt);
+}
+
+void packet_test_concat_small(void)
+{
+	odp_pool_capability_t capa;
+	odp_pool_t pool;
+	odp_pool_param_t param;
+	odp_packet_t pkt, pkt2;
+	int ret;
+	uint8_t *data;
+	uint32_t i;
+	uint32_t len = 32000;
+	uint8_t buf[len];
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	if (capa.pkt.max_len && capa.pkt.max_len < len)
+		len = capa.pkt.max_len;
+
+	odp_pool_param_init(&param);
+
+	param.type    = ODP_POOL_PACKET;
+	param.pkt.len = len;
+	param.pkt.num = PACKET_POOL_NUM;
+
+	pool = odp_pool_create("packet_pool_concat", &param);
+	CU_ASSERT(packet_pool != ODP_POOL_INVALID);
+
+	pkt = odp_packet_alloc(pool, 1);
+	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+
+	data  = odp_packet_data(pkt);
+	*data = 0;
+
+	for (i = 0; i < len - 1; i++) {
+		pkt2 = odp_packet_alloc(pool, 1);
+		CU_ASSERT_FATAL(pkt2 != ODP_PACKET_INVALID);
+
+		data  = odp_packet_data(pkt2);
+		*data = i + 1;
+
+		ret = odp_packet_concat(&pkt, pkt2);
+		CU_ASSERT(ret >= 0);
+
+		if (ret < 0) {
+			odp_packet_free(pkt2);
+			break;
+		}
+	}
+
+	CU_ASSERT(odp_packet_len(pkt) == len);
+
+	len = odp_packet_len(pkt);
+
+	memset(buf, 0, len);
+	CU_ASSERT(odp_packet_copy_to_mem(pkt, 0, len, buf) == 0);
+
+	for (i = 0; i < len; i++)
+		CU_ASSERT(buf[i] == (i % 256));
+
+	odp_packet_free(pkt);
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
+}
+
+void packet_test_concat_extend_trunc(void)
+{
+	odp_pool_capability_t capa;
+	odp_pool_t pool;
+	odp_pool_param_t param;
+	odp_packet_t pkt, pkt2;
+	int i, ret;
+	uint32_t alloc_len, ext_len, trunc_len, cur_len;
+	uint32_t len = 1900;
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	if (capa.pkt.max_len && capa.pkt.max_len < len)
+		len = capa.pkt.max_len;
+
+	alloc_len = len / 8;
+	ext_len   = len / 4;
+	trunc_len = len / 3;
+
+	odp_pool_param_init(&param);
+
+	param.type    = ODP_POOL_PACKET;
+	param.pkt.len = len;
+	param.pkt.num = PACKET_POOL_NUM;
+
+	pool = odp_pool_create("packet_pool_concat", &param);
+	CU_ASSERT_FATAL(packet_pool != ODP_POOL_INVALID);
+
+	pkt = odp_packet_alloc(pool, alloc_len);
+	CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+
+	cur_len = odp_packet_len(pkt);
+
+	for (i = 0; i < 2; i++) {
+		pkt2 = odp_packet_alloc(pool, alloc_len);
+		CU_ASSERT_FATAL(pkt2 != ODP_PACKET_INVALID);
+
+		ret = odp_packet_concat(&pkt, pkt2);
+		CU_ASSERT(ret >= 0);
+
+		if (ret < 0)
+			odp_packet_free(pkt2);
+
+		CU_ASSERT(odp_packet_len(pkt) == (cur_len + alloc_len));
+		cur_len = odp_packet_len(pkt);
+		CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+	}
+
+	ret = odp_packet_extend_tail(&pkt, ext_len, NULL, NULL);
+	CU_ASSERT(ret >= 0);
+
+	CU_ASSERT(odp_packet_len(pkt) == (cur_len + ext_len));
+	cur_len = odp_packet_len(pkt);
+	CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+
+	ret = odp_packet_extend_head(&pkt, ext_len, NULL, NULL);
+	CU_ASSERT(ret >= 0);
+
+	CU_ASSERT(odp_packet_len(pkt) == (cur_len + ext_len));
+	cur_len = odp_packet_len(pkt);
+	CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+
+	pkt2 = odp_packet_alloc(pool, alloc_len);
+	CU_ASSERT_FATAL(pkt2 != ODP_PACKET_INVALID);
+
+	ret = odp_packet_concat(&pkt, pkt2);
+	CU_ASSERT(ret >= 0);
+
+	if (ret < 0)
+		odp_packet_free(pkt2);
+
+	CU_ASSERT(odp_packet_len(pkt) == (cur_len + alloc_len));
+	cur_len = odp_packet_len(pkt);
+	CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+
+	ret = odp_packet_trunc_head(&pkt, trunc_len, NULL, NULL);
+	CU_ASSERT(ret >= 0);
+
+	CU_ASSERT(odp_packet_len(pkt) == (cur_len - trunc_len));
+	cur_len = odp_packet_len(pkt);
+	CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+
+	ret = odp_packet_trunc_tail(&pkt, trunc_len, NULL, NULL);
+	CU_ASSERT(ret >= 0);
+
+	CU_ASSERT(odp_packet_len(pkt) == (cur_len - trunc_len));
+	cur_len = odp_packet_len(pkt);
+	CU_ASSERT(cur_len == odp_packet_unshared_len(pkt));
+
+	odp_packet_free(pkt);
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
+}
+
+void packet_test_extend_small(void)
+{
+	odp_pool_capability_t capa;
+	odp_pool_t pool;
+	odp_pool_param_t param;
+	odp_packet_t pkt;
+	int ret, round;
+	uint8_t *data;
+	uint32_t i, seg_len;
+	int tail = 1;
+	uint32_t len = 32000;
+	uint8_t buf[len];
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	if (capa.pkt.max_len && capa.pkt.max_len < len)
+		len = capa.pkt.max_len;
+
+	odp_pool_param_init(&param);
+
+	param.type    = ODP_POOL_PACKET;
+	param.pkt.len = len;
+	param.pkt.num = PACKET_POOL_NUM;
+
+	pool = odp_pool_create("packet_pool_extend", &param);
+	CU_ASSERT_FATAL(packet_pool != ODP_POOL_INVALID);
+
+	for (round = 0; round < 2; round++) {
+		pkt = odp_packet_alloc(pool, 1);
+		CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+
+		data  = odp_packet_data(pkt);
+		*data = 0;
+
+		for (i = 0; i < len - 1; i++) {
+			if (tail) {
+				ret = odp_packet_extend_tail(&pkt, 1,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+			} else {
+				ret = odp_packet_extend_head(&pkt, 1,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+			}
+
+			if (ret < 0)
+				break;
+
+			if (tail) {
+				/* assert needs brackets */
+				CU_ASSERT(seg_len == 1);
+			} else {
+				CU_ASSERT(seg_len > 0);
+			}
+
+			*data = i + 1;
+		}
+
+		CU_ASSERT(odp_packet_len(pkt) == len);
+		CU_ASSERT(odp_packet_unshared_len(pkt) == len);
+
+		len = odp_packet_len(pkt);
+
+		memset(buf, 0, len);
+		CU_ASSERT(odp_packet_copy_to_mem(pkt, 0, len, buf) == 0);
+
+		for (i = 0; i < len; i++) {
+			int match;
+
+			if (tail) {
+				match = (buf[i] == (i % 256));
+				CU_ASSERT(match);
+			} else {
+				match = (buf[len - 1 - i] == (i % 256));
+				CU_ASSERT(match);
+			}
+
+			/* Limit the number of failed asserts to
+			   one per packet */
+			if (!match)
+				break;
+		}
+
+		odp_packet_free(pkt);
+
+		tail = 0;
+	}
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
+}
+
+void packet_test_extend_large(void)
+{
+	odp_pool_capability_t capa;
+	odp_pool_t pool;
+	odp_pool_param_t param;
+	odp_packet_t pkt;
+	int ret, round;
+	uint8_t *data;
+	uint32_t i, seg_len, ext_len, cur_len, cur_data;
+	int tail = 1;
+	int num_div = 16;
+	int div = 1;
+	uint32_t len = 32000;
+	uint8_t buf[len];
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	if (capa.pkt.max_len && capa.pkt.max_len < len)
+		len = capa.pkt.max_len;
+
+	odp_pool_param_init(&param);
+
+	param.type    = ODP_POOL_PACKET;
+	param.pkt.len = len;
+	param.pkt.num = PACKET_POOL_NUM;
+
+	pool = odp_pool_create("packet_pool_extend", &param);
+	CU_ASSERT_FATAL(packet_pool != ODP_POOL_INVALID);
+
+	for (round = 0; round < 2 * num_div; round++) {
+		ext_len = len / div;
+		cur_len = ext_len;
+
+		pkt = odp_packet_alloc(pool, ext_len);
+		CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+
+		cur_data = 0;
+
+		if (tail) {
+			ret = fill_data_forward(pkt, 0, ext_len, &cur_data);
+			CU_ASSERT(ret == 0);
+		} else {
+			ret = fill_data_backward(pkt, 0, ext_len, &cur_data);
+			CU_ASSERT(ret == 0);
+		}
+
+		while (cur_len < len) {
+			if ((len - cur_len) < ext_len)
+				ext_len = len - cur_len;
+
+			if (tail) {
+				ret = odp_packet_extend_tail(&pkt, ext_len,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+			} else {
+				ret = odp_packet_extend_head(&pkt, ext_len,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+			}
+
+			if (ret < 0)
+				break;
+
+			if (tail) {
+				/* assert needs brackets */
+				CU_ASSERT((seg_len > 0) &&
+					  (seg_len <= ext_len));
+				ret = fill_data_forward(pkt, cur_len, ext_len,
+							&cur_data);
+				CU_ASSERT(ret == 0);
+			} else {
+				CU_ASSERT(seg_len > 0);
+				CU_ASSERT(data == odp_packet_data(pkt));
+				ret = fill_data_backward(pkt, 0, ext_len,
+							 &cur_data);
+				CU_ASSERT(ret == 0);
+			}
+
+			cur_len += ext_len;
+		}
+
+		CU_ASSERT(odp_packet_len(pkt) == len);
+
+		len = odp_packet_len(pkt);
+
+		memset(buf, 0, len);
+		CU_ASSERT(odp_packet_copy_to_mem(pkt, 0, len, buf) == 0);
+
+		for (i = 0; i < len; i++) {
+			int match;
+
+			if (tail) {
+				match = (buf[i] == (i % 256));
+				CU_ASSERT(match);
+			} else {
+				match = (buf[len - 1 - i] == (i % 256));
+				CU_ASSERT(match);
+			}
+
+			/* Limit the number of failed asserts to
+			   one per packet */
+			if (!match)
+				break;
+		}
+
+		odp_packet_free(pkt);
+
+		div++;
+		if (div > num_div) {
+			/* test extend head */
+			div  = 1;
+			tail = 0;
+		}
+	}
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
+}
+
+void packet_test_extend_mix(void)
+{
+	odp_pool_capability_t capa;
+	odp_pool_t pool;
+	odp_pool_param_t param;
+	odp_packet_t pkt;
+	int ret, round;
+	uint8_t *data;
+	uint32_t i, seg_len, ext_len, cur_len, cur_data;
+	int small_count;
+	int tail = 1;
+	uint32_t len = 32000;
+	uint8_t buf[len];
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	if (capa.pkt.max_len && capa.pkt.max_len < len)
+		len = capa.pkt.max_len;
+
+	odp_pool_param_init(&param);
+
+	param.type    = ODP_POOL_PACKET;
+	param.pkt.len = len;
+	param.pkt.num = PACKET_POOL_NUM;
+
+	pool = odp_pool_create("packet_pool_extend", &param);
+	CU_ASSERT_FATAL(packet_pool != ODP_POOL_INVALID);
+
+	for (round = 0; round < 2; round++) {
+		small_count = 30;
+		ext_len = len / 10;
+		cur_len = ext_len;
+
+		pkt = odp_packet_alloc(pool, ext_len);
+		CU_ASSERT_FATAL(pkt != ODP_PACKET_INVALID);
+
+		cur_data = 0;
+
+		if (tail) {
+			ret = fill_data_forward(pkt, 0, ext_len, &cur_data);
+			CU_ASSERT(ret == 0);
+		} else {
+			ret = fill_data_backward(pkt, 0, ext_len, &cur_data);
+			CU_ASSERT(ret == 0);
+		}
+
+		while (cur_len < len) {
+			if (small_count) {
+				small_count--;
+				ext_len = len / 100;
+			} else {
+				ext_len = len / 4;
+			}
+
+			if ((len - cur_len) < ext_len)
+				ext_len = len - cur_len;
+
+			if (tail) {
+				ret = odp_packet_extend_tail(&pkt, ext_len,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+				CU_ASSERT((seg_len > 0) &&
+					  (seg_len <= ext_len));
+				ret = fill_data_forward(pkt, cur_len, ext_len,
+							&cur_data);
+				CU_ASSERT(ret == 0);
+			} else {
+				ret = odp_packet_extend_head(&pkt, ext_len,
+							     (void **)&data,
+							     &seg_len);
+				CU_ASSERT(ret >= 0);
+				CU_ASSERT(seg_len > 0);
+				CU_ASSERT(data == odp_packet_data(pkt));
+				ret = fill_data_backward(pkt, 0, ext_len,
+							 &cur_data);
+				CU_ASSERT(ret == 0);
+			}
+
+			cur_len += ext_len;
+		}
+
+		CU_ASSERT(odp_packet_len(pkt) == len);
+
+		len = odp_packet_len(pkt);
+
+		memset(buf, 0, len);
+		CU_ASSERT(odp_packet_copy_to_mem(pkt, 0, len, buf) == 0);
+
+		for (i = 0; i < len; i++) {
+			int match;
+
+			if (tail) {
+				match = (buf[i] == (i % 256));
+				CU_ASSERT(match);
+			} else {
+				match = (buf[len - 1 - i] == (i % 256));
+				CU_ASSERT(match);
+			}
+
+			/* Limit the number of failed asserts to
+			   one per packet */
+			if (!match)
+				break;
+		}
+
+		odp_packet_free(pkt);
+
+		tail = 0;
+	}
+
+	CU_ASSERT(odp_pool_destroy(pool) == 0);
+}
+
+void packet_test_extend_ref(void)
+{
+	odp_packet_t max_pkt, ref;
+	uint32_t hr, tr, max_len;
+	odp_pool_capability_t capa;
+
+	CU_ASSERT_FATAL(odp_pool_capability(&capa) == 0);
+
+	max_pkt = odp_packet_copy(segmented_test_packet,
+				  odp_packet_pool(segmented_test_packet));
+	CU_ASSERT_FATAL(max_pkt != ODP_PACKET_INVALID);
+	max_len = odp_packet_len(max_pkt);
+
+	/* Maximize the max pkt */
+	hr = odp_packet_headroom(max_pkt);
+	tr = odp_packet_tailroom(max_pkt);
+	odp_packet_push_head(max_pkt, hr);
+	odp_packet_push_tail(max_pkt, tr);
+
+	/* Max packet should not be extendable at either end */
+	if (max_len == capa.pkt.max_len) {
+		CU_ASSERT(odp_packet_extend_tail(&max_pkt, 1, NULL, NULL) < 0);
+		CU_ASSERT(odp_packet_extend_head(&max_pkt, 1, NULL, NULL) < 0);
+	}
+
+	/* See if we can trunc and extend anyway */
+	CU_ASSERT(odp_packet_trunc_tail(&max_pkt, hr + tr + 1,
+					NULL, NULL) >= 0);
+	CU_ASSERT(odp_packet_extend_head(&max_pkt, 1, NULL, NULL) >= 0);
+	CU_ASSERT(odp_packet_len(max_pkt) == max_len);
+	CU_ASSERT(odp_packet_unshared_len(max_pkt) == max_len);
+
+	/* Now try with a reference in place */
+	CU_ASSERT(odp_packet_trunc_tail(&max_pkt, 100, NULL, NULL) >= 0);
+	ref = odp_packet_ref(max_pkt, 100);
+
+	/* Verify ref lengths */
+	CU_ASSERT(ref != ODP_PACKET_INVALID);
+	CU_ASSERT(odp_packet_len(ref) == max_len - 200);
+	if (odp_packet_has_ref(ref) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(ref) == 0);
+
+		/* And ref's affect on max_pkt */
+		CU_ASSERT(odp_packet_has_ref(max_pkt) == 1);
+		CU_ASSERT(odp_packet_unshared_len(max_pkt) == 100);
+	} else {
+		CU_ASSERT(odp_packet_unshared_len(ref) == odp_packet_len(ref));
+		CU_ASSERT(odp_packet_unshared_len(max_pkt) ==
+			  odp_packet_len(max_pkt));
+	}
+
+	/* Now extend max_pkt and verify effect */
+	CU_ASSERT(odp_packet_extend_head(&max_pkt, 10, NULL, NULL) >= 0);
+	CU_ASSERT(odp_packet_len(max_pkt) == max_len - 90);
+
+	if (odp_packet_has_ref(max_pkt) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(max_pkt) == 110);
+	}
+
+	/* Extend on max_pkt should not affect ref */
+	CU_ASSERT(odp_packet_len(ref) == max_len - 200);
+
+	if (odp_packet_has_ref(ref) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref) == 0);
+	}
+
+	/* Now extend ref and verify effect*/
+	CU_ASSERT(odp_packet_extend_head(&ref, 20, NULL, NULL) >= 0);
+	CU_ASSERT(odp_packet_len(ref) == max_len - 180);
+
+	if (odp_packet_has_ref(ref) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref) == 20);
+	}
+
+	/* Extend on ref should not affect max_pkt */
+	CU_ASSERT(odp_packet_len(max_pkt) == max_len - 90);
+
+	if (odp_packet_has_ref(max_pkt) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(max_pkt) == 110);
+	}
+
+	/* Trunc max_pkt of all unshared len */
+	CU_ASSERT(odp_packet_trunc_head(&max_pkt, 110, NULL, NULL) >= 0);
+
+	/* Verify effect on max_pkt */
+	CU_ASSERT(odp_packet_len(max_pkt) == max_len - 200);
+
+	if (odp_packet_has_ref(max_pkt) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(max_pkt) == 0);
+	}
+
+	/* Verify that ref is unchanged */
+	CU_ASSERT(odp_packet_len(ref) == max_len - 180);
+
+	if (odp_packet_has_ref(ref) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref) == 20);
+	}
+
+	/* Free ref and verify that max_pkt is back to being unreferenced */
+	odp_packet_free(ref);
+	CU_ASSERT(odp_packet_has_ref(max_pkt) == 0);
+	CU_ASSERT(odp_packet_len(max_pkt) == max_len - 200);
+	CU_ASSERT(odp_packet_unshared_len(max_pkt) == max_len - 200);
+
+	odp_packet_free(max_pkt);
 }
 
 void packet_test_align(void)
@@ -1242,9 +1991,9 @@ void packet_test_align(void)
 		/* Alignment doesn't change packet length or contents */
 		CU_ASSERT(odp_packet_len(pkt) == pkt_len);
 		(void)odp_packet_offset(pkt, offset, &aligned_seglen, NULL);
-		_packet_compare_offset(pkt, offset,
-				       segmented_test_packet, offset,
-				       aligned_seglen);
+		packet_compare_offset(pkt, offset,
+				      segmented_test_packet, offset,
+				      aligned_seglen);
 
 		/* Verify requested contiguous addressabilty */
 		CU_ASSERT(aligned_seglen >= seg_len + 2);
@@ -1264,8 +2013,8 @@ void packet_test_align(void)
 	aligned_data = odp_packet_offset(pkt, offset, &aligned_seglen, NULL);
 
 	CU_ASSERT(odp_packet_len(pkt) == pkt_len);
-	_packet_compare_offset(pkt, offset, segmented_test_packet, offset,
-			       aligned_seglen);
+	packet_compare_offset(pkt, offset, segmented_test_packet, offset,
+			      aligned_seglen);
 	CU_ASSERT((uintptr_t)aligned_data % max_align == 0);
 
 	odp_packet_free(pkt);
@@ -1317,6 +2066,332 @@ void packet_test_offset(void)
 	CU_ASSERT_PTR_NOT_NULL(ptr);
 }
 
+void packet_test_ref(void)
+{
+	odp_packet_t base_pkt, segmented_base_pkt, hdr_pkt[4],
+		ref_pkt[4], refhdr_pkt[4], hdr_cpy;
+	uint32_t pkt_len, segmented_pkt_len, hdr_len[4], offset[4], hr[4],
+		base_hr, ref_len[4];
+	int i;
+
+	base_pkt = odp_packet_copy(test_packet, odp_packet_pool(test_packet));
+	base_hr = odp_packet_headroom(base_pkt);
+	pkt_len  = odp_packet_len(test_packet);
+	CU_ASSERT_FATAL(base_pkt != ODP_PACKET_INVALID);
+
+	segmented_base_pkt =
+		odp_packet_copy(segmented_test_packet,
+				odp_packet_pool(segmented_test_packet));
+	segmented_pkt_len = odp_packet_len(segmented_test_packet);
+	CU_ASSERT_FATAL(segmented_base_pkt != ODP_PACKET_INVALID);
+
+	CU_ASSERT(odp_packet_has_ref(base_pkt) == 0);
+
+	hdr_pkt[0] =
+		odp_packet_copy_part(segmented_test_packet, 0,
+				     odp_packet_len(segmented_test_packet) / 4,
+				     odp_packet_pool(segmented_test_packet));
+	CU_ASSERT_FATAL(hdr_pkt[0] != ODP_PACKET_INVALID);
+	hdr_len[0] = odp_packet_len(hdr_pkt[0]);
+	offset[0]  = 0;
+
+	hdr_pkt[1] =
+		odp_packet_copy_part(segmented_test_packet, 10,
+				     odp_packet_len(segmented_test_packet) / 8,
+				     odp_packet_pool(segmented_test_packet));
+	CU_ASSERT_FATAL(hdr_pkt[1] != ODP_PACKET_INVALID);
+	hdr_len[1] = odp_packet_len(hdr_pkt[1]);
+	offset[1]  = 5;
+
+	hdr_pkt[2] = odp_packet_copy_part(test_packet, 0,
+					  odp_packet_len(test_packet) / 4,
+					  odp_packet_pool(test_packet));
+	CU_ASSERT_FATAL(hdr_pkt[2] != ODP_PACKET_INVALID);
+	hdr_len[2] = odp_packet_len(hdr_pkt[2]);
+	offset[2]  = 64;
+
+	hdr_pkt[3] = odp_packet_copy_part(test_packet, 0,
+					  odp_packet_len(test_packet) / 4,
+					  odp_packet_pool(test_packet));
+	CU_ASSERT_FATAL(hdr_pkt[3] != ODP_PACKET_INVALID);
+	hdr_len[3] = odp_packet_len(hdr_pkt[3]);
+	offset[3]  = 64;
+
+	/* Nothing is a ref or has a ref before we start */
+	for (i = 0; i < 4; i++) {
+		CU_ASSERT(odp_packet_has_ref(hdr_pkt[i]) == 0);
+		CU_ASSERT(odp_packet_len(hdr_pkt[i]) ==
+			  odp_packet_unshared_len(hdr_pkt[i]));
+	}
+
+	/* Create a couple of refs */
+	refhdr_pkt[0] = odp_packet_ref_pkt(base_pkt, offset[0], hdr_pkt[0]);
+	refhdr_pkt[1] = odp_packet_ref_pkt(base_pkt, offset[1], hdr_pkt[1]);
+
+	CU_ASSERT(refhdr_pkt[0] != ODP_PACKET_INVALID);
+	CU_ASSERT(refhdr_pkt[1] != ODP_PACKET_INVALID);
+
+	/* If base packet has now references, ref packet should be also
+	 * references. */
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		CU_ASSERT(odp_packet_has_ref(refhdr_pkt[0]) == 1);
+		CU_ASSERT(odp_packet_has_ref(refhdr_pkt[1]) == 1);
+
+		CU_ASSERT(odp_packet_unshared_len(base_pkt) == 0);
+	} else {
+		CU_ASSERT(odp_packet_unshared_len(base_pkt) == pkt_len);
+	}
+
+	CU_ASSERT(odp_packet_len(refhdr_pkt[0]) ==
+		  hdr_len[0] + pkt_len - offset[0]);
+	CU_ASSERT(odp_packet_len(refhdr_pkt[1]) ==
+		  hdr_len[1] + pkt_len - offset[1]);
+
+	if (odp_packet_has_ref(refhdr_pkt[0]) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[0]) == hdr_len[0]);
+	} else {
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[0]) ==
+			  odp_packet_len(refhdr_pkt[0]));
+	}
+
+	if (odp_packet_has_ref(refhdr_pkt[1]) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[1]) == hdr_len[1]);
+	} else {
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[1]) ==
+			  odp_packet_len(refhdr_pkt[1]));
+	}
+
+	packet_compare_offset(refhdr_pkt[0], hdr_len[0],
+			      base_pkt, offset[0],
+			      pkt_len - offset[0]);
+
+	packet_compare_offset(refhdr_pkt[1], hdr_len[1],
+			      base_pkt, offset[1],
+			      pkt_len - offset[1]);
+
+	/* See if compound references are supported and if so that they
+	 * operate properly */
+	hdr_cpy = odp_packet_copy(hdr_pkt[2], odp_packet_pool(hdr_pkt[2]));
+	CU_ASSERT_FATAL(hdr_cpy != ODP_PACKET_INVALID);
+
+	refhdr_pkt[2] = odp_packet_ref_pkt(refhdr_pkt[0], 2, hdr_cpy);
+	CU_ASSERT(refhdr_pkt[2] != ODP_PACKET_INVALID);
+
+	if (odp_packet_has_ref(refhdr_pkt[2]) == 1) {
+		CU_ASSERT(odp_packet_has_ref(refhdr_pkt[0]) == 1);
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[2]) == hdr_len[2]);
+		CU_ASSERT(odp_packet_unshared_len(refhdr_pkt[0]) == 2);
+	}
+
+	/* Delete the refs */
+	odp_packet_free(refhdr_pkt[0]);
+	odp_packet_free(refhdr_pkt[1]);
+	odp_packet_free(refhdr_pkt[2]);
+
+	/* Verify that base_pkt no longer has a ref */
+	CU_ASSERT(odp_packet_has_ref(base_pkt) == 0);
+
+	/* Now create a two more shared refs */
+	refhdr_pkt[2] = odp_packet_ref_pkt(base_pkt, offset[2], hdr_pkt[2]);
+	refhdr_pkt[3] = odp_packet_ref_pkt(base_pkt, offset[3], hdr_pkt[3]);
+
+	CU_ASSERT(hdr_pkt[2] != ODP_PACKET_INVALID);
+	CU_ASSERT(hdr_pkt[3] != ODP_PACKET_INVALID);
+
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		CU_ASSERT(odp_packet_has_ref(refhdr_pkt[2]) == 1);
+		CU_ASSERT(odp_packet_has_ref(refhdr_pkt[3]) == 1);
+	}
+
+	CU_ASSERT(odp_packet_len(refhdr_pkt[2]) ==
+		  odp_packet_len(refhdr_pkt[3]));
+
+	packet_compare_offset(refhdr_pkt[2], 0,
+			      refhdr_pkt[3], 0,
+			      odp_packet_len(hdr_pkt[2]));
+
+	/* Delete the headers */
+	odp_packet_free(refhdr_pkt[2]);
+	odp_packet_free(refhdr_pkt[3]);
+
+	/* Verify that base_pkt is no longer ref'd */
+	CU_ASSERT(odp_packet_has_ref(base_pkt) == 0);
+
+	/* Create a static reference */
+	ref_pkt[0] = odp_packet_ref_static(base_pkt);
+	CU_ASSERT(ref_pkt[0] != ODP_PACKET_INVALID);
+
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_has_ref(ref_pkt[0]) == 1);
+	}
+
+	CU_ASSERT(odp_packet_len(ref_pkt[0]) == odp_packet_len(base_pkt));
+	packet_compare_offset(ref_pkt[0], 0, base_pkt, 0,
+			      odp_packet_len(base_pkt));
+
+	/* Now delete it */
+	odp_packet_free(ref_pkt[0]);
+	CU_ASSERT(odp_packet_has_ref(base_pkt) == 0);
+
+	/* Create references */
+	ref_pkt[0] = odp_packet_ref(segmented_base_pkt, offset[0]);
+	CU_ASSERT_FATAL(ref_pkt[0] != ODP_PACKET_INVALID);
+
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_has_ref(segmented_base_pkt) == 1);
+	}
+
+	ref_pkt[1] = odp_packet_ref(segmented_base_pkt, offset[1]);
+	CU_ASSERT_FATAL(ref_pkt[1] != ODP_PACKET_INVALID);
+
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_has_ref(segmented_base_pkt) == 1);
+	}
+
+	/* Verify reference lengths */
+	CU_ASSERT(odp_packet_len(ref_pkt[0]) == segmented_pkt_len - offset[0]);
+	CU_ASSERT(odp_packet_len(ref_pkt[1]) == segmented_pkt_len - offset[1]);
+
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) == 0);
+	}
+
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 0);
+	}
+
+	/* Free the base pkts -- references should still be valid */
+	odp_packet_free(base_pkt);
+	odp_packet_free(segmented_base_pkt);
+
+	packet_compare_offset(ref_pkt[0], 0,
+			      segmented_test_packet, offset[0],
+			      segmented_pkt_len - offset[0]);
+	packet_compare_offset(ref_pkt[1], 0,
+			      segmented_test_packet, offset[1],
+			      segmented_pkt_len - offset[1]);
+
+	/* Verify we can modify the refs */
+	hr[0] = odp_packet_headroom(ref_pkt[0]);
+	hr[1] = odp_packet_headroom(ref_pkt[1]);
+
+	CU_ASSERT(odp_packet_push_head(ref_pkt[0], hr[0]) != NULL);
+
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) == hr[0]);
+	}
+
+	CU_ASSERT(odp_packet_len(ref_pkt[0]) ==
+		  hr[0] + segmented_pkt_len - offset[0]);
+
+	CU_ASSERT(odp_packet_pull_head(ref_pkt[0], hr[0] / 2) != NULL);
+
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) ==
+			  hr[0] - (hr[0] / 2));
+	}
+
+	if (hr[1] > 0) {
+		CU_ASSERT(odp_packet_push_head(ref_pkt[1], 1) != NULL);
+		if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+			/* CU_ASSERT needs braces */
+			CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 1);
+		}
+		CU_ASSERT(odp_packet_len(ref_pkt[1]) ==
+			  1 + segmented_pkt_len - offset[1]);
+		CU_ASSERT(odp_packet_pull_head(ref_pkt[1], 1) != NULL);
+		if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+			/* CU_ASSERT needs braces */
+			CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 0);
+		}
+		CU_ASSERT(odp_packet_len(ref_pkt[1]) ==
+			  segmented_pkt_len - offset[1]);
+	}
+
+	odp_packet_free(ref_pkt[0]);
+	odp_packet_free(ref_pkt[1]);
+
+	/* Verify we can modify base packet after reference is created */
+	base_pkt = odp_packet_copy(test_packet, odp_packet_pool(test_packet));
+
+	ref_pkt[1] = odp_packet_ref(base_pkt, offset[1]);
+	CU_ASSERT_FATAL(ref_pkt[1] != ODP_PACKET_INVALID);
+	ref_len[1] = odp_packet_len(ref_pkt[1]);
+	CU_ASSERT(ref_len[1] == odp_packet_len(base_pkt) - offset[1]);
+
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 0);
+	}
+
+	CU_ASSERT(odp_packet_push_head(base_pkt, base_hr / 2) != NULL);
+
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(base_pkt) ==
+			  base_hr / 2 + offset[1]);
+	}
+	CU_ASSERT(odp_packet_len(ref_pkt[1]) == ref_len[1]);
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 0);
+	}
+
+	ref_pkt[0] = odp_packet_ref(base_pkt, offset[0]);
+	CU_ASSERT_FATAL(ref_pkt[0] != ODP_PACKET_INVALID);
+	ref_len[0] = odp_packet_len(ref_pkt[0]);
+	CU_ASSERT(ref_len[0] = odp_packet_len(base_pkt) - offset[0]);
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) == 0);
+	}
+
+	CU_ASSERT(odp_packet_push_head(base_pkt,
+				       base_hr - base_hr / 2) != NULL);
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		CU_ASSERT(odp_packet_unshared_len(base_pkt) ==
+			  base_hr - base_hr / 2 + offset[0]);
+	}
+	CU_ASSERT(odp_packet_len(ref_pkt[1]) == ref_len[1]);
+	CU_ASSERT(odp_packet_len(ref_pkt[0]) == ref_len[0]);
+
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == 0);
+	}
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) == 0);
+	}
+
+	hr[0] = odp_packet_headroom(ref_pkt[0]);
+	hr[1] = odp_packet_headroom(ref_pkt[1]);
+	CU_ASSERT(odp_packet_push_head(ref_pkt[0], hr[0]) != NULL);
+	CU_ASSERT(odp_packet_push_head(ref_pkt[1], hr[1]) != NULL);
+	if (odp_packet_has_ref(ref_pkt[0]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[0]) == hr[0]);
+	}
+	if (odp_packet_has_ref(ref_pkt[1]) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(ref_pkt[1]) == hr[1]);
+	}
+	if (odp_packet_has_ref(base_pkt) == 1) {
+		/* CU_ASSERT needs braces */
+		CU_ASSERT(odp_packet_unshared_len(base_pkt) ==
+			  base_hr - base_hr / 2 + offset[0]);
+	}
+
+	odp_packet_free(base_pkt);
+	odp_packet_free(ref_pkt[0]);
+	odp_packet_free(ref_pkt[1]);
+}
+
 odp_testinfo_t packet_suite[] = {
 	ODP_TEST_INFO(packet_test_alloc_free),
 	ODP_TEST_INFO(packet_test_alloc_free_multi),
@@ -1338,8 +2413,15 @@ odp_testinfo_t packet_suite[] = {
 	ODP_TEST_INFO(packet_test_copy),
 	ODP_TEST_INFO(packet_test_copydata),
 	ODP_TEST_INFO(packet_test_concatsplit),
+	ODP_TEST_INFO(packet_test_concat_small),
+	ODP_TEST_INFO(packet_test_concat_extend_trunc),
+	ODP_TEST_INFO(packet_test_extend_small),
+	ODP_TEST_INFO(packet_test_extend_large),
+	ODP_TEST_INFO(packet_test_extend_mix),
+	ODP_TEST_INFO(packet_test_extend_ref),
 	ODP_TEST_INFO(packet_test_align),
 	ODP_TEST_INFO(packet_test_offset),
+	ODP_TEST_INFO(packet_test_ref),
 	ODP_TEST_INFO_NULL,
 };
 

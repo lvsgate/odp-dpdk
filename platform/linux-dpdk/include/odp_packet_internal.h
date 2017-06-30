@@ -29,63 +29,14 @@ extern "C" {
 #include <odp/api/crypto.h>
 #include <odp_crypto_internal.h>
 #include <protocols/eth.h>
+#include <odp/api/plat/packet_types.h>
 
 #include <rte_acl_osdep.h>
 
 /** Minimum segment length expected by packet_parse_common() */
 #define PACKET_PARSE_SEG_LEN 96
 
-/**
- * Packet input & protocol flags
- */
-typedef union {
-	/* All input flags */
-	uint64_t all;
-
-	struct {
-		uint64_t parsed_l2:1; /**< L2 parsed */
-		uint64_t dst_queue:1; /**< Dst queue present */
-
-		uint64_t timestamp:1; /**< Timestamp present */
-
-		uint64_t l2:1;        /**< known L2 protocol present */
-		uint64_t l3:1;        /**< known L3 protocol present */
-		uint64_t l4:1;        /**< known L4 protocol present */
-
-		uint64_t eth:1;       /**< Ethernet */
-		uint64_t eth_bcast:1; /**< Ethernet broadcast */
-		uint64_t eth_mcast:1; /**< Ethernet multicast */
-		uint64_t jumbo:1;     /**< Jumbo frame */
-		uint64_t vlan:1;      /**< VLAN hdr found */
-		uint64_t vlan_qinq:1; /**< Stacked VLAN found, QinQ */
-
-		uint64_t snap:1;      /**< SNAP */
-		uint64_t arp:1;       /**< ARP */
-
-		uint64_t ipv4:1;      /**< IPv4 */
-		uint64_t ipv6:1;      /**< IPv6 */
-		uint64_t ip_bcast:1;  /**< IP broadcast */
-		uint64_t ip_mcast:1;  /**< IP multicast */
-		uint64_t ipfrag:1;    /**< IP fragment */
-		uint64_t ipopt:1;     /**< IP optional headers */
-
-		uint64_t ipsec:1;     /**< IPSec packet. Required by the
-					   odp_packet_has_ipsec_set() func. */
-		uint64_t ipsec_ah:1;  /**< IPSec authentication header */
-		uint64_t ipsec_esp:1; /**< IPSec encapsulating security
-					   payload */
-		uint64_t udp:1;       /**< UDP */
-		uint64_t tcp:1;       /**< TCP */
-		uint64_t tcpopt:1;    /**< TCP options present */
-		uint64_t sctp:1;      /**< SCTP */
-		uint64_t icmp:1;      /**< ICMP */
-
-		uint64_t color:2;     /**< Packet color for traffic mgmt */
-		uint64_t nodrop:1;    /**< Drop eligibility status */
-	};
-} input_flags_t;
-
-ODP_STATIC_ASSERT(sizeof(input_flags_t) == sizeof(uint64_t),
+ODP_STATIC_ASSERT(sizeof(_odp_packet_input_flags_t) == sizeof(uint64_t),
 		  "INPUT_FLAGS_SIZE_ERROR");
 
 /**
@@ -118,13 +69,14 @@ typedef union {
 	uint32_t all;
 
 	struct {
+		/** adjustment for traffic mgr */
+		uint32_t shaper_len_adj:8;
+
 		/* Bitfield flags for each output option */
 		uint32_t l3_chksum_set:1; /**< L3 chksum bit is valid */
 		uint32_t l3_chksum:1;     /**< L3 chksum override */
 		uint32_t l4_chksum_set:1; /**< L3 chksum bit is valid */
 		uint32_t l4_chksum:1;     /**< L4 chksum override  */
-
-		int8_t shaper_len_adj;    /**< adjustment for traffic mgr */
 	};
 } output_flags_t;
 
@@ -147,7 +99,7 @@ typedef enum {
  * Packet parser metadata
  */
 typedef struct {
-	input_flags_t  input_flags;
+	_odp_packet_input_flags_t  input_flags;
 	error_flags_t  error_flags;
 	output_flags_t output_flags;
 
@@ -158,30 +110,46 @@ typedef struct {
 	uint32_t l3_len;    /**< Layer 3 length */
 	uint32_t l4_len;    /**< Layer 4 length */
 
-	layer_t parsed_layers;	/**< Highest parsed protocol stack layer */
 	uint16_t ethtype;	/**< EtherType */
-	uint8_t ip_proto;	/**< IP protocol */
+	uint8_t  ip_proto;	/**< IP protocol */
+	uint8_t  parsed_layers;	/**< Highest parsed protocol stack layer */
 
 } packet_parser_t;
 
 /**
  * Internal Packet header
+ *
+ * To optimize fast path performance this struct is not initialized to zero in
+ * packet_init(). Because of this any new fields added must be reviewed for
+ * initialization requirements.
  */
 typedef struct {
 	/* common buffer header */
 	odp_buffer_hdr_t buf_hdr;
 
-	odp_pktio_t input;       /**< Originating pktio */
+	/*
+	 * Following members are initialized by packet_init()
+	 */
 
-	/* Following members are initialized by packet_init() */
 	packet_parser_t p;
 
-	odp_queue_t dst_queue;   /**< Classifier destination queue */
-	uint32_t uarea_size;     /**< User metadata size, it's right after
-				      odp_packet_hdr_t*/
-	odp_time_t timestamp;    /**< Timestamp value */
+	odp_pktio_t input;
 
-	odp_crypto_generic_op_result_t op_result;  /**< Result for crypto */
+	/*
+	 * Members below are not initialized by packet_init()
+	 */
+
+	/* User metadata size, it's right after odp_packet_hdr_t */
+	uint32_t uarea_size;
+
+	/* Timestamp value */
+	odp_time_t timestamp;
+
+	/* Classifier destination queue */
+	odp_queue_t dst_queue;
+
+	/* Result for crypto */
+	odp_crypto_generic_op_result_t op_result;
 } odp_packet_hdr_t __rte_cache_aligned;
 
 /**
@@ -189,7 +157,12 @@ typedef struct {
  */
 static inline odp_packet_hdr_t *odp_packet_hdr(odp_packet_t pkt)
 {
-	return (odp_packet_hdr_t *)pkt;
+	return (odp_packet_hdr_t *)(uintptr_t)pkt;
+}
+
+static inline struct rte_mbuf *pkt_to_mbuf(odp_packet_hdr_t *pkt_hdr)
+{
+	return &pkt_hdr->buf_hdr.mb;
 }
 
 static inline void copy_packet_parser_metadata(odp_packet_hdr_t *src_hdr,
@@ -209,7 +182,7 @@ static inline void copy_packet_cls_metadata(odp_packet_hdr_t *src_hdr,
 
 static inline uint32_t packet_len(odp_packet_hdr_t *pkt_hdr)
 {
-	return odp_packet_len((odp_packet_t)pkt_hdr);
+	return rte_pktmbuf_pkt_len(&pkt_hdr->buf_hdr.mb);
 }
 
 static inline void packet_set_len(odp_packet_hdr_t *pkt_hdr, uint32_t len)
@@ -252,8 +225,15 @@ static inline void _odp_packet_reset_parse(odp_packet_t pkt)
 {
 	odp_packet_hdr_t *pkt_hdr = odp_packet_hdr(pkt);
 
+	uint32_t frame_len = rte_pktmbuf_pkt_len(&pkt_hdr->buf_hdr.mb);
+
 	pkt_hdr->p.parsed_layers = LAYER_NONE;
-	packet_parse_l2(&pkt_hdr->p, odp_packet_len(pkt));
+	pkt_hdr->p.input_flags.all = 0;
+	pkt_hdr->p.output_flags.all = 0;
+	pkt_hdr->p.error_flags.all = 0;
+	pkt_hdr->p.l2_offset = 0;
+
+	packet_parse_l2(&pkt_hdr->p, frame_len);
 }
 
 /* Perform packet parse up to a given protocol layer */
@@ -283,6 +263,11 @@ static inline int packet_hdr_has_eth(odp_packet_hdr_t *pkt_hdr)
 	return pkt_hdr->p.input_flags.eth;
 }
 
+static inline int packet_hdr_has_ipv6(odp_packet_hdr_t *pkt_hdr)
+{
+	return pkt_hdr->p.input_flags.ipv6;
+}
+
 static inline void packet_set_ts(odp_packet_hdr_t *pkt_hdr, odp_time_t *ts)
 {
 	if (ts != NULL) {
@@ -295,7 +280,7 @@ int packet_parse_common(packet_parser_t *pkt_hdr, const uint8_t *ptr,
 			uint32_t pkt_len, uint32_t seg_len, layer_t layer);
 
 /* We can't enforce tailroom reservation for received packets */
-ODP_STATIC_ASSERT(ODP_CONFIG_PACKET_TAILROOM == 0,
+ODP_STATIC_ASSERT(CONFIG_PACKET_TAILROOM == 0,
 		  "ERROR: Tailroom has to be 0, DPDK doesn't support this");
 
 #ifdef __cplusplus

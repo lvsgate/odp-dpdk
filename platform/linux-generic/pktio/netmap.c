@@ -8,6 +8,9 @@
 
 #include <odp_posix_extensions.h>
 
+#include <odp/api/plat/packet_inlines.h>
+#include <odp/api/packet.h>
+
 #include <odp_packet_io_internal.h>
 #include <odp_packet_netmap.h>
 #include <odp_packet_socket.h>
@@ -345,9 +348,7 @@ static int netmap_open(odp_pktio_t id ODP_UNUSED, pktio_entry_t *pktio_entry,
 	pkt_nm->pool = pool;
 
 	/* max frame len taking into account the l2-offset */
-	pkt_nm->max_frame_len = ODP_CONFIG_PACKET_BUF_LEN_MAX -
-		odp_buffer_pool_headroom(pool) -
-		odp_buffer_pool_tailroom(pool);
+	pkt_nm->max_frame_len = CONFIG_PACKET_MAX_SEG_LEN;
 
 	/* allow interface to be opened with or without the 'netmap:' prefix */
 	prefix = "netmap:";
@@ -454,7 +455,7 @@ static int netmap_start(pktio_entry_t *pktio_entry)
 {
 	pkt_netmap_t *pkt_nm = &pktio_entry->s.pkt_nm;
 	netmap_ring_t *desc_ring;
-	struct nm_desc base_desc;
+	struct nm_desc *desc_ptr;
 	unsigned i;
 	unsigned j;
 	unsigned num_rx_desc = 0;
@@ -505,18 +506,27 @@ static int netmap_start(pktio_entry_t *pktio_entry)
 				 pktio_entry->s.num_out_queue,
 				 pktio_entry->s.num_out_queue);
 
-	memset(&base_desc, 0, sizeof(struct nm_desc));
+	/* Use nm_open() to parse netmap flags from interface name */
+	desc_ptr = nm_open(pkt_nm->nm_name, NULL, 0, NULL);
+	if (desc_ptr == NULL) {
+		ODP_ERR("nm_start(%s) failed\n", pkt_nm->nm_name);
+		goto error;
+	}
+	struct nm_desc base_desc = *desc_ptr;
+
+	nm_close(desc_ptr);
+
 	base_desc.self = &base_desc;
 	base_desc.mem = NULL;
-	memcpy(base_desc.req.nr_name, pkt_nm->if_name, sizeof(pkt_nm->if_name));
-	base_desc.req.nr_flags &= ~NR_REG_MASK;
-
-	if (num_rx_desc == 1)
-		base_desc.req.nr_flags |= NR_REG_ALL_NIC;
-	else
-		base_desc.req.nr_flags |= NR_REG_ONE_NIC;
-
 	base_desc.req.nr_ringid = 0;
+	if ((base_desc.req.nr_flags & NR_REG_MASK) == NR_REG_ALL_NIC ||
+	    (base_desc.req.nr_flags & NR_REG_MASK) == NR_REG_ONE_NIC) {
+		base_desc.req.nr_flags &= ~NR_REG_MASK;
+		if (num_rx_desc == 1)
+			base_desc.req.nr_flags |= NR_REG_ALL_NIC;
+		else
+			base_desc.req.nr_flags |= NR_REG_ONE_NIC;
+	}
 
 	/* Only the first rx descriptor does mmap */
 	desc_ring = pkt_nm->rx_desc_ring;
@@ -550,8 +560,12 @@ static int netmap_start(pktio_entry_t *pktio_entry)
 	/* Open tx descriptors */
 	desc_ring = pkt_nm->tx_desc_ring;
 	flags = NM_OPEN_IFNAME | NM_OPEN_NO_MMAP;
-	base_desc.req.nr_flags &= ~NR_REG_ALL_NIC;
-	base_desc.req.nr_flags |= NR_REG_ONE_NIC;
+
+	if ((base_desc.req.nr_flags & NR_REG_MASK) == NR_REG_ALL_NIC) {
+		base_desc.req.nr_flags &= ~NR_REG_ALL_NIC;
+		base_desc.req.nr_flags |= NR_REG_ONE_NIC;
+	}
+
 	for (i = 0; i < pktio_entry->s.num_out_queue; i++) {
 		for (j = desc_ring[i].s.first; j <= desc_ring[i].s.last; j++) {
 			base_desc.req.nr_ringid = j;
@@ -795,7 +809,7 @@ static int netmap_send(pktio_entry_t *pktio_entry, int index,
 
 	for (nb_tx = 0; nb_tx < num; nb_tx++) {
 		pkt = pkt_table[nb_tx];
-		pkt_len = odp_packet_len(pkt);
+		pkt_len = _odp_packet_len(pkt);
 
 		if (pkt_len > pkt_nm->mtu) {
 			if (nb_tx == 0)
@@ -830,10 +844,12 @@ static int netmap_send(pktio_entry_t *pktio_entry, int index,
 	if (!pkt_nm->lockless_tx)
 		odp_ticketlock_unlock(&pkt_nm->tx_desc_ring[index].s.lock);
 
-	odp_packet_free_multi(pkt_table, nb_tx);
-
-	if (odp_unlikely(nb_tx == 0 && __odp_errno != 0))
-		return -1;
+	if (odp_unlikely(nb_tx == 0)) {
+		if (__odp_errno != 0)
+			return -1;
+	} else {
+		odp_packet_free_multi(pkt_table, nb_tx);
+	}
 
 	return nb_tx;
 }

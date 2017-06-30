@@ -1,8 +1,11 @@
 *.trs
 *.log
 chksum
+cuckootable
+iplookuptable
 odpthreads
 parse
 process
 table
 thread
+pthread

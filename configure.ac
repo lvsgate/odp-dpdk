@@ -3,7 +3,7 @@ AC_PREREQ([2.5])
 # Set correct API version
 ##########################################################################
 m4_define([odpapi_generation_version], [1])
-m4_define([odpapi_major_version], [12])
+m4_define([odpapi_major_version], [14])
 m4_define([odpapi_minor_version], [0])
 m4_define([odpapi_point_version], [0])
 m4_define([odpapi_version],
@@ -38,10 +38,10 @@ AM_SILENT_RULES([yes])
 # 3. if interfaces were removed, then use C+1:0:0
 ##########################################################################
 
-ODP_LIBSO_VERSION=112:0:0
+ODP_LIBSO_VERSION=114:0:1
 AC_SUBST(ODP_LIBSO_VERSION)
 
-ODPHELPER_LIBSO_VERSION=110:1:1
+ODPHELPER_LIBSO_VERSION=112:0:0
 AC_SUBST(ODPHELPER_LIBSO_VERSION)
 
 # Checks for programs.
@@ -52,6 +52,8 @@ AC_PROG_CXX
 
 AC_PROG_INSTALL
 AC_PROG_MAKE_SET
+
+AC_PROG_LN_S
 
 AM_PROG_AR
 #Use libtool
@@ -120,6 +122,26 @@ then
 fi
 
 ##########################################################################
+# Architecture for ABI support
+##########################################################################
+AS_CASE([$host],
+  [x86*],     [ARCH_ABI=x86_64-linux],
+  [i686*],    [ARCH_ABI=x86_32-linux],
+  [mips64*],  [ARCH_ABI=mips64-linux],
+  [powerpc*], [ARCH_ABI=power64-linux],
+  [aarch64*], [ARCH_ABI=arm64-linux],
+  [arm*],     [ARCH_ABI=arm32-linux],
+  [ARCH_ABI=undefined]
+)
+AC_SUBST([ARCH_ABI])
+
+if test "${ARCH_ABI}" == "undefined";
+then
+    echo "ARCH_ABI is undefined, please add your ARCH_ABI based on host=${host}"
+    exit 1
+fi
+
+##########################################################################
 # Set correct pkgconfig version
 ##########################################################################
 PKGCONFIG_VERSION=$(echo $VERSION | awk -F '.git' '{print $1}')
@@ -151,14 +173,12 @@ m4_include([./test/m4/configure.m4])
 ##########################################################################
 AC_ARG_WITH([sdk-install-path],
 AC_HELP_STRING([--with-sdk-install-path=DIR path to external libs and headers],
-	     [(or in the default path if not specified).]),
+    [(or in the default path if not specified).]),
     [SDK_INSTALL_PATH=$withval
-         DPDK_HEADER_HACK=0
-         AM_CPPFLAGS="$AM_CPPFLAGS -I$SDK_INSTALL_PATH/include"
-         AM_LDFLAGS="$AM_LDFLAGS -L$SDK_INSTALL_PATH/lib"
-    ],[DPDK_HEADER_HACK=1])
+    DPDK_DEFAULT_DIR=0],
+    [DPDK_DEFAULT_DIR=1])
 
-AC_SUBST(DPDK_HEADER_HACK)
+AC_SUBST(DPDK_DEFAULT_DIR)
 AC_SUBST(SDK_INSTALL_PATH)
 
 ##########################################################################
@@ -196,7 +216,7 @@ AM_CONDITIONAL([netmap_support], [test x$netmap_support = xyes ])
 AM_CONDITIONAL([PKTIO_IPC], [test x$pktio_ipc_support = xyes])
 AM_CONDITIONAL([PKTIO_DPDK], [test x$pktio_dpdk_support = xyes ])
 AM_CONDITIONAL([HAVE_PCAP], [test $have_pcap = yes])
-AM_CONDITIONAL([DPDK_HEADER_HACK], [test "x${DPDK_HEADER_HACK}" = "x1"])
+AM_CONDITIONAL([DPDK_DEFAULT_DIR], [test "x${DPDK_DEFAULT_DIR}" = "x1"])
 AM_CONDITIONAL([test_installdir], [test "$testdir" != ""])
 AM_CONDITIONAL([cunit_support], [test x$cunit_support = xyes ])
 AM_CONDITIONAL([test_vald], [test x$test_vald = xyes ])
@@ -208,6 +228,7 @@ AM_CONDITIONAL([test_example], [test x$test_example = xyes ])
 AM_CONDITIONAL([HAVE_DOXYGEN], [test "x${DOXYGEN}" = "xdoxygen"])
 AM_CONDITIONAL([user_guide], [test "x${user_guides}" = "xyes" ])
 AM_CONDITIONAL([HAVE_MSCGEN], [test "x${MSCGEN}" = "xmscgen"])
+AM_CONDITIONAL([helper_linux], [test x$helper_linux = xyes ])
 
 ##########################################################################
 # Setup doxygen documentation
@@ -221,7 +242,9 @@ DX_INIT_DOXYGEN($PACKAGE_NAME,
 		${srcdir}/doc/helper-guide/Doxyfile,
 		${builddir}/doc/helper-guide/output,
 		${srcdir}/doc/platform-api-guide/Doxyfile,
-		${builddir}/doc/platform-api-guide/output)
+		${builddir}/doc/platform-api-guide/output,
+		${srcdir}/doc/driver-api-guide/Doxyfile,
+		${builddir}/doc/driver-api-guide/output)
 
 ##########################################################################
 # Enable/disable ODP_DEBUG_PRINT
@@ -235,6 +258,16 @@ AC_ARG_ENABLE([debug-print],
 	ODP_DEBUG_PRINT=0
     fi])
 ODP_CFLAGS="$ODP_CFLAGS -DODP_DEBUG_PRINT=$ODP_DEBUG_PRINT"
+
+ODPH_DEBUG_PRINT=0
+AC_ARG_ENABLE([helper-debug-print],
+    [  --enable-helper-debug-print    display helper debugging information],
+    [if test "x$enableval" = "xyes"; then
+	ODPH_DEBUG_PRINT=1
+     else
+	ODPH_DEBUG_PRINT=0
+    fi])
+ODP_CFLAGS="$ODP_CFLAGS -DODPH_DEBUG_PRINT=$ODPH_DEBUG_PRINT"
 
 ##########################################################################
 # Enable/disable ODP_DEBUG
@@ -298,10 +331,8 @@ AM_CFLAGS="$AM_CFLAGS $ODP_CFLAGS"
 AM_CXXFLAGS="-std=c++11"
 
 AC_CONFIG_FILES([Makefile
-		 helper/Makefile
-		 helper/test/Makefile
 		 pkgconfig/libodp-dpdk.pc
-		 pkgconfig/libodphelper-linux.pc
+		 pkgconfig/libodphelper-linux-generic.pc
 		 ])
 
 AC_SEARCH_LIBS([timer_create],[rt posix4])
@@ -326,8 +357,11 @@ AC_MSG_RESULT([
 	Helper Library version:	${ODPHELPER_LIBSO_VERSION}
 
 	implementation_name:	${IMPLEMENTATION_NAME}
+	host:			${host}
 	ARCH_DIR		${ARCH_DIR}
+	ARCH_ABI		${ARCH_ABI}
 	with_platform:		${with_platform}
+	helper_linux:		${helper_linux}
 	prefix:			${prefix}
 	sysconfdir:		${sysconfdir}
 	libdir:			${libdir}

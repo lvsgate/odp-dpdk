@@ -17,10 +17,7 @@
 #include <example_debug.h>
 
 #include <odp.h>
-#include <odp/helper/linux.h>
-#include <odp/helper/eth.h>
-#include <odp/helper/ip.h>
-#include <odp/helper/udp.h>
+#include <odp/helper/odph_api.h>
 
 /** @def SHM_PKT_POOL_SIZE
  * @brief Size of the shared memory block
@@ -30,7 +27,7 @@
 /** @def SHM_PKT_POOL_BUF_SIZE
  * @brief Buffer size of the packet pool buffer
  */
-#define SHM_PKT_POOL_BUF_SIZE  1856
+#define SHM_PKT_POOL_BUF_SIZE  100
 
 /** @def MAX_PKT_BURST
  * @brief Maximum number of packet bursts
@@ -45,6 +42,12 @@
 #define TEST_SEQ_MAGIC_2	0x81638340
 
 #define TEST_ALLOC_MAGIC	0x1234adcd
+
+#define TEST_IPC_PKTIO_NAME	"ipc:ipktio"
+#define TEST_IPC_PKTIO_PID_NAME "ipc:%d:ipktio"
+
+/** Can be any name, same or not the same. */
+#define TEST_IPC_POOL_NAME "ipc_packet_pool"
 
 /** magic number and sequence at start of packet payload */
 typedef struct ODP_PACKED {
@@ -63,8 +66,8 @@ char *pktio_name;
 /** Run time in seconds */
 int run_time_sec;
 
-/** IPC name space id /dev/shm/odp-nsid-objname */
-int ipc_name_space;
+/** PID of the master process */
+int master_pid;
 
 /* helper funcs */
 void parse_args(int argc, char *argv[]);
@@ -75,11 +78,12 @@ void usage(char *progname);
  * Create a ipc pktio handle.
  *
  * @param pool Pool to associate with device for packet RX/TX
+ * @param master_pid Pid of master process
  *
  * @return The handle of the created pktio object.
  * @retval ODP_PKTIO_INVALID if the create fails.
  */
-odp_pktio_t create_pktio(odp_pool_t pool);
+odp_pktio_t create_pktio(odp_pool_t pool, int master_pid);
 
 /** Spin and send all packet from table
  *

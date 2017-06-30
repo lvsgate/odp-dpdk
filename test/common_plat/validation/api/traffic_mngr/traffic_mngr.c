@@ -12,11 +12,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <odp.h>
-#include <odp/helper/eth.h>
-#include <odp/helper/ip.h>
-#include <odp/helper/udp.h>
-#include <odp/helper/tcp.h>
-#include <odp/helper/chksum.h>
+#include <odp/helper/odph_api.h>
 #include <test_debug.h>
 #include "odp_cunit_common.h"
 #include "traffic_mngr.h"
@@ -944,8 +940,8 @@ static void dump_rcvd_pkts(uint32_t first_rcv_idx, uint32_t last_rcv_idx)
 	odp_packet_t    rcv_pkt;
 	uint32_t        rcv_idx;
 	int32_t         xmt_idx;
-	uint16_t        unique_id;
-	uint8_t         is_ipv4;
+	uint16_t        unique_id = 0;
+	uint8_t         is_ipv4 = 0;
 	int             rc;
 
 	for (rcv_idx = first_rcv_idx; rcv_idx <= last_rcv_idx; rcv_idx++) {

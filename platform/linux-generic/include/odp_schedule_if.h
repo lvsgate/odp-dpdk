@@ -12,13 +12,8 @@ extern "C" {
 #endif
 
 #include <odp/api/queue.h>
+#include <odp_queue_internal.h>
 #include <odp/api/schedule.h>
-
-/* Constants defined by the scheduler. These should be converted into interface
- * functions. */
-
-/* Number of ordered locks per queue */
-#define SCHEDULE_ORDERED_LOCKS_PER_QUEUE 2
 
 typedef void (*schedule_pktio_start_fn_t)(int pktio_index, int num_in_queue,
 					  int in_queue_idx[]);
@@ -30,13 +25,17 @@ typedef int (*schedule_init_queue_fn_t)(uint32_t queue_index,
 				       );
 typedef void (*schedule_destroy_queue_fn_t)(uint32_t queue_index);
 typedef int (*schedule_sched_queue_fn_t)(uint32_t queue_index);
+typedef int (*schedule_unsched_queue_fn_t)(uint32_t queue_index);
 typedef int (*schedule_ord_enq_multi_fn_t)(uint32_t queue_index,
-					   void *buf_hdr[], int num,
-					   int sustain, int *ret);
+					   void *buf_hdr[], int num, int *ret);
 typedef int (*schedule_init_global_fn_t)(void);
 typedef int (*schedule_term_global_fn_t)(void);
 typedef int (*schedule_init_local_fn_t)(void);
 typedef int (*schedule_term_local_fn_t)(void);
+typedef void (*schedule_order_lock_fn_t)(void);
+typedef void (*schedule_order_unlock_fn_t)(void);
+typedef unsigned (*schedule_max_ordered_locks_fn_t)(void);
+typedef void (*schedule_save_context_fn_t)(queue_entry_t *queue);
 
 typedef struct schedule_fn_t {
 	schedule_pktio_start_fn_t   pktio_start;
@@ -46,11 +45,16 @@ typedef struct schedule_fn_t {
 	schedule_init_queue_fn_t    init_queue;
 	schedule_destroy_queue_fn_t destroy_queue;
 	schedule_sched_queue_fn_t   sched_queue;
+	schedule_unsched_queue_fn_t unsched_queue;
 	schedule_ord_enq_multi_fn_t ord_enq_multi;
 	schedule_init_global_fn_t   init_global;
 	schedule_term_global_fn_t   term_global;
 	schedule_init_local_fn_t    init_local;
 	schedule_term_local_fn_t    term_local;
+	schedule_order_lock_fn_t    order_lock;
+	schedule_order_unlock_fn_t  order_unlock;
+	schedule_max_ordered_locks_fn_t max_ordered_locks;
+	schedule_save_context_fn_t  save_context;
 } schedule_fn_t;
 
 /* Interface towards the scheduler */
