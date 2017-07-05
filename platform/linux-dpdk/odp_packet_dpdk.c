@@ -237,7 +237,7 @@ static int start_pkt_dpdk(pktio_entry_t *pktio_entry)
 			.mq_mode = ETH_MQ_RX_RSS,
 			.split_hdr_size = 0,
 			.header_split   = 0, /**< Header Split */
-			.hw_ip_checksum = 0, /**< IP checksum offload */
+			.hw_ip_checksum = 1, /**< IP checksum offload */
 			.hw_vlan_filter = 0, /**< VLAN filtering */
 			.jumbo_frame    = 1, /**< Jumbo Frame Support */
 			.hw_strip_crc   = 0, /**< CRC stripp by hardware */
